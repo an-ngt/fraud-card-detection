@@ -167,7 +167,7 @@ def generate_demo_data(n=6000, seed=42):
     df["hour"] = hour
     df["sin_hour"] = np.sin(2 * np.pi * hour / 24)
     df["cos_hour"] = np.cos(2 * np.pi * hour / 24)
-    df["is_night"] = ((hour >= 22) | (hour < 6)).astype(int)
+    df["is_night"] = ((hour >= 22) | (hour < 3)).astype(int)
     df["is_online"] = rng.integers(0, 2, n)
     df["age"] = rng.integers(18, 75, n)
     df["gender"] = rng.choice(["F", "M"], n)
@@ -216,46 +216,237 @@ def find_col(df, candidates):
 
 
 def prepare_features(df_raw, feature_cols, categorical_features, pandas_categorical):
+    """
+    Tự động tính toán tất cả các biến cần thiết từ dữ liệu thô,
+    theo đúng pipeline tiền xử lý trong đồ án (Chương 3).
+    """
     df = df_raw.copy()
     notes = []
 
+    # ── Bước 1: Chuyển đổi kiểu dữ liệu thời gian ────────────────────────
+    for time_col in ["trans_date_trans_time", "trans_datetime"]:
+        if time_col in df.columns and df[time_col].dtype == object:
+            df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+            notes.append(f"Đã chuyển `{time_col}` sang kiểu datetime.")
+
+    if "dob" in df.columns and df["dob"].dtype == object:
+        df["dob"] = pd.to_datetime(df["dob"], errors="coerce")
+
+    # ── Bước 2: Trích xuất giờ giao dịch từ timestamp ─────────────────────
+    if "hour" not in df.columns:
+        for time_col in ["trans_date_trans_time", "trans_datetime"]:
+            if time_col in df.columns and pd.api.types.is_datetime64_any_dtype(df[time_col]):
+                df["hour"] = df[time_col].dt.hour
+                notes.append(f"Đã trích xuất `hour` từ `{time_col}`.")
+                break
+
+    # ── Bước 3: Mã hóa chu kỳ cho giờ (Circular Encoding) ─────────────────
+    # Giúp mô hình hiểu 23h và 0h chỉ cách nhau 1 giờ
     if ("sin_hour" not in df.columns or "cos_hour" not in df.columns) and "hour" in df.columns:
         df["sin_hour"] = np.sin(2 * np.pi * df["hour"] / 24)
         df["cos_hour"] = np.cos(2 * np.pi * df["hour"] / 24)
-        notes.append("Đã tính `sin_hour`/`cos_hour` từ cột `hour`.")
+        notes.append("Đã tính `sin_hour`/`cos_hour` từ `hour` (Circular Encoding).")
 
+    # ── Bước 4: Biến nhị phân is_night ────────────────────────────────────
+    # Giao dịch ban đêm (22h–3h) có tỷ lệ gian lận cao gấp ~18 lần ban ngày
     if "is_night" not in df.columns:
         if "hour" in df.columns:
-            df["is_night"] = ((df["hour"] >= 22) | (df["hour"] < 6)).astype(int)
-            notes.append("Đã suy ra `is_night` từ cột `hour`.")
+            df["is_night"] = ((df["hour"] >= 22) | (df["hour"] < 3)).astype(int)
+            notes.append("Đã tính `is_night` từ `hour` (22h–3h = ban đêm).")
         elif "sin_hour" in df.columns and "cos_hour" in df.columns:
             hr = (np.degrees(np.arctan2(df["sin_hour"], df["cos_hour"])) / 15.0) % 24
-            df["is_night"] = ((hr >= 22) | (hr < 6)).astype(int)
+            df["is_night"] = ((hr >= 22) | (hr < 3)).astype(int)
             notes.append("Đã suy ra `is_night` từ `sin_hour`/`cos_hour`.")
 
-    if "amt_log" not in df.columns:
-        amt_col = find_col(df, CANDIDATE_AMOUNT_COLS)
-        if amt_col:
-            df["amt_log"] = np.log1p(df[amt_col].clip(lower=0))
-            notes.append(f"Đã tính `amt_log` từ cột `{amt_col}`.")
+    # ── Bước 5: Tuổi khách hàng tại thời điểm giao dịch ──────────────────
+    if "age" not in df.columns and "dob" in df.columns:
+        ref_time_col = next(
+            (c for c in ["trans_date_trans_time", "trans_datetime"] if c in df.columns
+             and pd.api.types.is_datetime64_any_dtype(df[c])), None
+        )
+        if ref_time_col:
+            df["age"] = ((df[ref_time_col] - df["dob"]).dt.days / 365.25).clip(0, 120).astype(float)
+        else:
+            df["age"] = (pd.Timestamp.now() - df["dob"]).dt.days / 365.25
+        df["age"] = df["age"].fillna(df["age"].median())
+        notes.append("Đã tính `age` từ `dob` và thời điểm giao dịch.")
 
-    if "amt_log_x_is_night" not in df.columns and {"amt_log", "is_night"}.issubset(df.columns):
-        df["amt_log_x_is_night"] = df["amt_log"] * df["is_night"]
+    # ── Bước 6: Biến đổi Log cho số tiền giao dịch ────────────────────────
+    # Giảm hệ số Skewness từ 42.28 xuống ~-0.30 → mô hình học tốt hơn
+    if "amt_log" not in df.columns:
+        amt_col_raw = find_col(df, CANDIDATE_AMOUNT_COLS)
+        if amt_col_raw:
+            df["amt_log"] = np.log1p(df[amt_col_raw].clip(lower=0))
+            notes.append(f"Đã tính `amt_log = log(1 + {amt_col_raw})` để giảm độ lệch phân phối.")
+        else:
+            df["amt_log"] = 0.0
+            notes.append("⚠️ Không tìm thấy cột số tiền — `amt_log` gán 0.")
+
+    # ── Bước 7: Khoảng cách địa lý Haversine (distance_km) ────────────────
+    # Thay thế 4 cột tọa độ (lat, long, merch_lat, merch_long) bằng 1 đặc trưng
+    if "distance_km" not in df.columns:
+        needed = {"lat", "long", "merch_lat", "merch_long"}
+        if needed.issubset(df.columns):
+            lat1 = np.radians(df["lat"].astype(float))
+            lon1 = np.radians(df["long"].astype(float))
+            lat2 = np.radians(df["merch_lat"].astype(float))
+            lon2 = np.radians(df["merch_long"].astype(float))
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+            df["distance_km"] = 6371.0 * 2 * np.arcsin(np.sqrt(a.clip(0, 1)))
+            notes.append("Đã tính `distance_km` bằng công thức Haversine từ lat/long của chủ thẻ và cửa hàng.")
+        else:
+            missing_geo = needed - set(df.columns)
+            if missing_geo:
+                notes.append(f"⚠️ Thiếu cột địa lý {missing_geo} — `distance_km` gán 0.")
+                df["distance_km"] = 0.0
+
+    # ── Bước 8: Phân loại Online / Offline ────────────────────────────────
+    # Dựa trên tên category: các danh mục kết thúc bằng "_net" là trực tuyến
+    ONLINE_CATEGORIES = {"shopping_net", "misc_net", "grocery_net"}
+    if "is_online" not in df.columns:
+        cat_col = find_col(df, ["category"])
+        if cat_col:
+            df["is_online"] = df[cat_col].astype(str).str.endswith("_net").astype(int)
+            notes.append("Đã suy ra `is_online` từ `category` (danh mục kết thúc `_net` = trực tuyến).")
+        else:
+            df["is_online"] = 0
+            notes.append("⚠️ Không tìm thấy `category` — `is_online` gán 0 (offline).")
+
+    # ── Bước 9: Phân mức rủi ro danh mục (category_risk_tier) ─────────────
+    HIGH_RISK_CATS = {"shopping_net", "misc_net", "grocery_pos", "shopping_pos"}
+    LOW_RISK_CATS = {"health_fitness", "home", "food_dining", "kids_pets"}
+    if "category_risk_tier" not in df.columns:
+        cat_col = find_col(df, ["category"])
+        if cat_col:
+            cats = df[cat_col].astype(str)
+            tier = pd.Series("Medium", index=df.index)
+            tier[cats.isin(HIGH_RISK_CATS)] = "High"
+            tier[cats.isin(LOW_RISK_CATS)] = "Low"
+            df["category_risk_tier"] = tier
+            notes.append("Đã phân nhóm `category_risk_tier` (High/Medium/Low) từ `category`.")
+        else:
+            df["category_risk_tier"] = "Medium"
+            notes.append("⚠️ Thiếu `category` — `category_risk_tier` gán mặc định Medium.")
+
+    # ── Bước 10: Tần suất xuất hiện của merchant (merchant_freq) ──────────
+    if "merchant_freq" not in df.columns:
+        merch_col = find_col(df, ["merchant"])
+        if merch_col:
+            freq_map = df[merch_col].value_counts(normalize=True)
+            df["merchant_freq"] = df[merch_col].map(freq_map).fillna(0.0)
+            notes.append("Đã tính `merchant_freq` (tần suất xuất hiện tương đối của mỗi merchant).")
+        else:
+            df["merchant_freq"] = 0.0
+            notes.append("⚠️ Thiếu `merchant` — `merchant_freq` gán 0.")
+
+    # ── Bước 11: Giới tính ─────────────────────────────────────────────────
+    if "gender" not in df.columns:
+        df["gender"] = "F"
+        notes.append("⚠️ Thiếu `gender` — gán mặc định F.")
+
+    # ── Bước 12: Đặc trưng hành vi lịch sử (expanding-window, tránh leakage) ─
+    # Sắp xếp theo thẻ và thời gian để tính expanding window đúng cách
+    sort_cols = []
+    id_col_cand = find_col(df, ["cc_num", "card_number", "customer_id", "cc_id"])
+    time_col_cand = next(
+        (c for c in ["trans_date_trans_time", "trans_datetime", "unix_time"] if c in df.columns), None
+    )
+
+    if id_col_cand and time_col_cand:
+        df = df.sort_values([id_col_cand, time_col_cand]).reset_index(drop=True)
+
+        # customer_total_spending & customer_avg_spending: expanding mean theo khách hàng
+        if "customer_avg_spending" not in df.columns or "customer_total_spending" not in df.columns:
+            amt_raw = find_col(df, CANDIDATE_AMOUNT_COLS)
+            if amt_raw:
+                grp = df.groupby(id_col_cand)[amt_raw]
+                df["customer_total_spending"] = grp.transform(lambda x: x.expanding().sum().shift(1)).fillna(0)
+                df["customer_avg_spending"] = grp.transform(lambda x: x.expanding().mean().shift(1)).fillna(df[amt_raw].median())
+                notes.append("Đã tính `customer_total_spending` & `customer_avg_spending` (expanding window).")
+
+        # amt_ratio: tỷ lệ giao dịch hiện tại / mức chi tiêu trung bình
+        if "amt_ratio" not in df.columns:
+            amt_raw = find_col(df, CANDIDATE_AMOUNT_COLS)
+            if amt_raw and "customer_avg_spending" in df.columns:
+                avg = df["customer_avg_spending"].replace(0, df[amt_raw].median())
+                df["amt_ratio"] = (df[amt_raw] / avg).clip(0, 50)
+                notes.append("Đã tính `amt_ratio` = amt / customer_avg_spending.")
+
+        # time_since_last_txn: giây giữa 2 giao dịch liên tiếp cùng khách hàng
+        if "time_since_last_txn" not in df.columns and time_col_cand != "unix_time":
+            dt_col = df[time_col_cand]
+            if pd.api.types.is_datetime64_any_dtype(dt_col):
+                df["time_since_last_txn"] = (
+                    df.groupby(id_col_cand)[time_col_cand]
+                    .transform(lambda x: x.diff().dt.total_seconds())
+                    .fillna(0)
+                )
+                notes.append("Đã tính `time_since_last_txn` (giây kể từ giao dịch trước của cùng khách hàng).")
+        elif "time_since_last_txn" not in df.columns and "unix_time" in df.columns:
+            df["time_since_last_txn"] = (
+                df.groupby(id_col_cand)["unix_time"]
+                .transform(lambda x: x.diff())
+                .fillna(0)
+            )
+            notes.append("Đã tính `time_since_last_txn` từ `unix_time`.")
+
+        # txn_count_24h: số giao dịch trong 24 giờ trước (rolling count)
+        if "txn_count_24h" not in df.columns:
+            try:
+                if time_col_cand != "unix_time" and pd.api.types.is_datetime64_any_dtype(df[time_col_cand]):
+                    df_tmp = df.set_index(time_col_cand)
+                    df["txn_count_24h"] = (
+                        df_tmp.groupby(id_col_cand)
+                        .apply(lambda g: g.rolling("24h").count().iloc[:, 0])
+                        .reset_index(level=0, drop=True)
+                        .reindex(df_tmp.index)
+                        .values
+                    )
+                else:
+                    # Dùng unix_time: 24h = 86400 giây
+                    def count_24h(sub):
+                        times = sub["unix_time"].values.astype(float)
+                        counts = np.array([((times[:i] >= t - 86400) & (times[:i] < t)).sum() for i, t in enumerate(times)])
+                        return pd.Series(counts, index=sub.index)
+                    df["txn_count_24h"] = df.groupby(id_col_cand, group_keys=False).apply(count_24h)
+                notes.append("Đã tính `txn_count_24h` (số giao dịch trong 24h trước của cùng khách hàng).")
+            except Exception as e:
+                df["txn_count_24h"] = 0
+                notes.append(f"⚠️ Không thể tính `txn_count_24h` ({e}) — gán 0.")
+    else:
+        # Không có thông tin thẻ/thời gian → dùng giá trị trung vị nếu thiếu
+        for col in ["customer_total_spending", "customer_avg_spending", "amt_ratio",
+                    "time_since_last_txn", "txn_count_24h"]:
+            if col not in df.columns:
+                df[col] = 0
+        if "customer_avg_spending" not in df.columns or df["customer_avg_spending"].eq(0).all():
+            amt_raw = find_col(df, CANDIDATE_AMOUNT_COLS)
+            if amt_raw:
+                df["customer_avg_spending"] = df[amt_raw]
+                df["amt_ratio"] = 1.0
+        missing_info = [c for c in ["cc_num", "customer_id"] if c not in df.columns]
+        if missing_info:
+            notes.append(
+                f"⚠️ Thiếu cột định danh khách hàng ({missing_info}) hoặc cột thời gian "
+                "— không thể tính đặc trưng hành vi lịch sử (expanding window). Gán giá trị 0."
+            )
+
+    # ── Bước 13: Đặc trưng tương tác (Interaction Features) ───────────────
     if "is_night_x_online" not in df.columns and {"is_night", "is_online"}.issubset(df.columns):
         df["is_night_x_online"] = df["is_night"] * df["is_online"]
 
-    if "category_risk_tier" not in df.columns:
-        df["category_risk_tier"] = "Medium"
-        notes.append("Thiếu cột `category_risk_tier` — gán mặc định **Medium** cho toàn bộ giao dịch.")
-    if "gender" not in df.columns:
-        df["gender"] = "F"
-        notes.append("Thiếu cột `gender` — gán mặc định **F** cho toàn bộ giao dịch.")
+    if "amt_log_x_is_night" not in df.columns and {"amt_log", "is_night"}.issubset(df.columns):
+        df["amt_log_x_is_night"] = df["amt_log"] * df["is_night"]
 
-    missing = [c for c in feature_cols if c not in df.columns]
-    for c in missing:
+    # ── Điền 0 cho bất kỳ cột nào vẫn còn thiếu ──────────────────────────
+    still_missing = [c for c in feature_cols if c not in df.columns]
+    for c in still_missing:
         df[c] = 0
-        notes.append(f"⚠️ Thiếu cột `{c}` — gán giá trị 0 (có thể làm giảm độ chính xác dự đoán).")
+        notes.append(f"⚠️ Thiếu cột `{c}` sau toàn bộ bước tiền xử lý — gán 0 (có thể làm giảm độ chính xác).")
 
+    # ── Tạo ma trận X để dự đoán ──────────────────────────────────────────
     X = df[feature_cols].copy()
 
     if pandas_categorical is not None:
@@ -267,7 +458,8 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
             X[col] = pd.Categorical(X[col], categories=cats)
     else:
         for col in categorical_features:
-            X[col] = X[col].astype("category")
+            if col in X.columns:
+                X[col] = X[col].astype("category")
 
     return X, df, notes
 
@@ -428,11 +620,19 @@ if raw_df is None:
     st.title("🛡️ Hệ thống hỗ trợ ra quyết định phát hiện gian lận")
     st.info("👈 Vui lòng tải lên dữ liệu giao dịch (.csv) hoặc bấm **“Dùng dữ liệu mẫu”** ở thanh bên để bắt đầu.")
     with st.expander("ℹ️ Cấu trúc dữ liệu khuyến nghị"):
-        st.write(
-            "Hệ thống hoạt động tốt nhất khi file CSV có các cột đặc trưng đã qua xử lý "
-            f"(`{', '.join(bundle['feature_cols'])}`), cùng các cột bổ sung tùy chọn: "
-            "`amount` (giá trị giao dịch), `is_fraud` (nhãn thực tế — để đánh giá & tối ưu ngưỡng), "
-            "`merchant`, `country`, `transaction_id`. Nếu thiếu, hệ thống sẽ tự suy ra hoặc dùng giá trị mặc định."
+        st.markdown(
+            "**Hệ thống tự tính đặc trưng từ dữ liệu thô.** Cung cấp càng nhiều cột gốc càng tốt:\n\n"
+            "| Cột gốc | Đặc trưng được tính |\n"
+            "|---|---|\n"
+            "| `trans_date_trans_time` | `hour`, `is_night`, `sin_hour`, `cos_hour` |\n"
+            "| `amt` | `amt_log`, `amt_ratio`, `amt_log_x_is_night` |\n"
+            "| `lat/long`, `merch_lat/long` | `distance_km` (Haversine) |\n"
+            "| `cc_num` + thời gian | `customer_avg_spending`, `time_since_last_txn`, `txn_count_24h` |\n"
+            "| `category` | `is_online`, `category_risk_tier` |\n"
+            "| `merchant` | `merchant_freq` |\n"
+            "| `dob` | `age` |\n\n"
+            "Cột `is_fraud` *(tùy chọn)* — cần để phân tích chi phí và tối ưu ngưỡng cảnh báo.\n\n"
+            "Nếu dữ liệu đã có các cột đặc trưng (`amt_log`, `is_night`, ...) thì hệ thống dùng trực tiếp."
         )
     st.stop()
 
