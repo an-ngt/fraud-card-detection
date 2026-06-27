@@ -712,7 +712,6 @@ if notes:
 def page_executive_summary():
     st.markdown('<div class="section-eyebrow">TRANG 1 · DÀNH CHO NHÀ QUẢN LÝ</div>', unsafe_allow_html=True)
     st.title("Tổng quan điều hành")
-    st.caption("Một cái nhìn tổng thể: điều gì đang xảy ra và nên hành động ra sao — không cần biết kỹ thuật mô hình.")
 
     total_txn = len(df_full)
     alerts = int((df_full["risk_level"].isin(["High", "Very High"])).sum())
@@ -800,7 +799,6 @@ def page_executive_summary():
 def page_descriptive():
     st.markdown('<div class="section-eyebrow">TRANG 2 · ĐIỀU GÌ ĐANG XẢY RA?</div>', unsafe_allow_html=True)
     st.title("Tình hình giao dịch")
-    st.caption("Thống kê tổng quan về dòng giao dịch, không liên quan đến mô hình dự đoán.")
 
     c1, c2 = st.columns(2)
     with c1:
