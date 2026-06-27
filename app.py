@@ -264,16 +264,19 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Thông số mô hình**")
+    m = METRICS
     st.markdown(f"""
 <div class="model-card">
 <p>Thuật toán: <b>LightGBM GBDT</b></p>
-<p>Số đặc trưng: <b>16</b></p>
-<p>Số cây: <b>1,296</b> / 2,000</p>
+<p>Số đặc trưng: <b>{len(FEATURE_COLS)}</b></p>
 <p>Threshold tối ưu: <b>{BEST_THRESHOLD}</b></p>
-<p>PR-AUC: <b>{METRICS.get("pr_auc", "0.9500")}</b></p>
-<p>PR-AUC (5-fold CV): <b>0.9466 ± 0.0043</b></p>
-<p>Recall ($): <b>{METRICS.get("dollar_recall", "99.52")}%</b></p>
-<p>ROC-AUC: <b>0.9990</b></p>
+<p>PR-AUC: <b>{float(m.get("pr_auc", 0)):.4f}</b></p>
+<p>PR-AUC 5-fold CV: <b>{float(m.get("cv_pr_auc_mean", 0)):.4f} ± {float(m.get("cv_pr_auc_std", 0)):.4f}</b></p>
+<p>ROC-AUC: <b>{float(m.get("roc_auc", 0)):.4f}</b></p>
+<p>Recall (số lượng): <b>{float(m.get("recall_count", 0))*100:.2f}%</b></p>
+<p>Recall (theo $): <b>{float(m.get("dollar_recall", 0)):.2f}%</b></p>
+<p>Precision (theo $): <b>{float(m.get("dollar_precision", 0)):.2f}%</b></p>
+<p>Chi phí ước tính: <b>${float(m.get("estimated_cost", 0)):,.0f}</b></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -316,9 +319,14 @@ with tab1:
         df_out = df_raw.copy()
         df_out["risk_score"] = np.round(proba, 4)
         df_out["fraud_pred"] = pred
+        # phân cấp dựa trên BEST_THRESHOLD:
+        # < threshold     → An toàn   (dưới ngưỡng phát hiện)
+        # threshold – 0.5 → Trung bình (trên ngưỡng, cần xem xét)
+        # >= 0.5          → Rất cao   (xác suất fraud rõ ràng)
+        MID = 0.5
         df_out["risk_level"] = pd.cut(
             proba,
-            bins=[-0.001, 0.4, 0.75, 1.001],
+            bins=[-0.001, BEST_THRESHOLD, MID, 1.001],
             labels=["🟢 An toàn", "🟡 Trung bình", "🔴 Rất cao"]
         )
 
@@ -446,8 +454,8 @@ with tab1:
 
         def highlight(row):
             s = row.get("risk_score", 0)
-            if s >= 0.75: return ["background-color:#fef2f2"] * len(row)
-            if s >= 0.40: return ["background-color:#fffbeb"] * len(row)
+            if s >= 0.5:             return ["background-color:#fef2f2"] * len(row)
+            if s >= BEST_THRESHOLD:  return ["background-color:#fffbeb"] * len(row)
             return [""] * len(row)
 
         fmt = {k: v for k, v in
@@ -505,10 +513,11 @@ with tab2:
             score = float(row["risk_score"])
 
             # banner mức rủi ro
-            if score >= 0.75:
+            # ngưỡng phân cấp khớp với risk_level ở Tab 1
+            if score >= 0.5:
                 css, icon, lbl = "a-hi", "🔴", "RẤT CAO"
                 rec = "**Tự động tạm khóa giao dịch** — Gửi OTP cảnh báo khẩn đến chủ thẻ, chuyển hồ sơ sang đội kiểm soát ưu tiên 1."
-            elif score >= 0.40:
+            elif score >= BEST_THRESHOLD:
                 css, icon, lbl = "a-md", "🟡", "TRUNG BÌNH"
                 rec = "**Kích hoạt xác thực mạnh (2FA)** — Tăng cường giám sát, đặc biệt nếu danh mục rủi ro cao hoặc giao dịch ban đêm."
             else:
@@ -525,7 +534,7 @@ with tab2:
             # gauge + thông tin
             cg, ci = st.columns([1, 2])
             with cg:
-                bar_color = "#dc2626" if score >= 0.75 else "#f59e0b" if score >= 0.40 else "#16a34a"
+                bar_color = "#dc2626" if score >= 0.5 else "#f59e0b" if score >= BEST_THRESHOLD else "#16a34a"
                 fig_g = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=score * 100,
@@ -534,9 +543,9 @@ with tab2:
                         "axis": {"range": [0, 100], "tickfont": {"color": "#374151"}},
                         "bar":  {"color": bar_color},
                         "steps": [
-                            {"range": [0,  40],  "color": "#f0fdf4"},
-                            {"range": [40, 75],  "color": "#fffbeb"},
-                            {"range": [75, 100], "color": "#fef2f2"},
+                            {"range": [0,  16.0],  "color": "#f0fdf4"},
+                            {"range": [16.0, 50], "color": "#fffbeb"},
+                            {"range": [50, 100], "color": "#fef2f2"},
                         ],
                         "threshold": {
                             "line":  {"color": "#1e40af", "width": 3},
@@ -640,9 +649,9 @@ with tab2:
 
             # ── Khuyến nghị ────────────────────────────
             st.markdown('<div class="sec">Khuyến nghị xử lý</div>', unsafe_allow_html=True)
-            if score >= 0.75:
+            if score >= 0.5:
                 st.error(rec)
-            elif score >= 0.40:
+            elif score >= BEST_THRESHOLD:
                 st.warning(rec)
             else:
                 st.success(rec)
