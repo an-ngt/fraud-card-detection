@@ -43,15 +43,44 @@ h1, h2, h3, h4 {{
 .stApp {{
     background-color: {PAPER};
 }}
-section[data-testid="stSidebar"] {{
-    background-color: {INK};
-}}
-section[data-testid="stSidebar"] * {{
-    color: #E9E9E6 !important;
-}}
-section[data-testid="stSidebar"] hr {{
-    border-color: #2A2F3A;
-}}
+/* ──────────────────────────────────────────────────────────────────────────
+   CẤU HÌNH SIDEBAR - TỐI ƯU ĐỘ TƯƠNG PHẢN & ĐỘ RÕ RÀNG
+   ────────────────────────────────────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+    background-color: {INK} !important;
+}
+
+/* 1. Đưa toàn bộ text cơ bản, label của widget về màu trắng thuần */
+section[data-testid="stSidebar"] p, 
+section[data-testid="stSidebar"] label, 
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] .stWidgetLabel p {
+    color: #FFFFFF !important;
+}
+
+/* 2. Làm nổi bật các tiêu đề chính (Mô hình, Dữ liệu, Điều hướng) */
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] strong {
+    color: #FFFFFF !important;
+    font-weight: 700 !important;
+}
+
+/* 3. Sửa chữ bị mờ trong khung File Uploader (Giúp nhìn rõ "Upload", "200MB per file") */
+section[data-testid="stSidebar"] [data-testid="stFileUploadDropzone"] div {
+    color: #E2E8F0 !important;
+}
+
+/* 4. Định dạng chữ nhỏ (Caption bên dưới logo) sang màu xám xanh dịu mắt nhưng vẫn đủ rõ */
+section[data-testid="stSidebar"] .stCaption, 
+section[data-testid="stSidebar"] small {
+    color: #A0AEC0 !important;
+}
+
+/* 5. Giữ đường kẻ phân tách tinh tế */
+section[data-testid="stSidebar"] hr {
+    border-color: #2D3748 !important;
+}
 
 /* Thẻ KPI */
 .kpi-card {{
