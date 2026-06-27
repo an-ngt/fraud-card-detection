@@ -855,58 +855,171 @@ def page_diagnostic():
     st.title("Phân tích nguyên nhân")
 
     if has_ground_truth:
-        fraud_df = df_full[df_full[label_col].astype(int) == 1]
+        fraud_df = df_full[df_full[label_col].astype(int) == 1].copy()
         basis_note = "dựa trên giao dịch **gian lận thực tế** (`is_fraud = 1`)"
     else:
-        fraud_df = df_full[df_full["risk_level"].isin(["High", "Very High"])]
+        fraud_df = df_full[df_full["risk_level"].isin(["High", "Very High"])].copy()
         basis_note = "dựa trên giao dịch **được mô hình dự đoán rủi ro cao** (chưa có nhãn thực tế để xác nhận)"
 
     st.caption(f"Các thống kê dưới đây {basis_note}.")
 
     if len(fraud_df) == 0:
         st.warning("Không có giao dịch nào để phân tích nguyên nhân (0 giao dịch gian lận/nguy cơ cao).")
-    else:
-        total_fraud = len(fraud_df)
-        night_pct = fraud_df["is_night"].mean() * 100 if "is_night" in fraud_df.columns else np.nan
-        online_pct = fraud_df["is_online"].mean() * 100 if "is_online" in fraud_df.columns else np.nan
-        intl_pct = (
-            (fraud_df[country_col] != fraud_df[country_col].mode()[0]).mean() * 100
-            if country_col
-            else np.nan
-        )
-        high_tier_pct = (
-            (fraud_df["category_risk_tier"] == "High").mean() * 100 if "category_risk_tier" in fraud_df.columns else np.nan
-        )
+        return  # ← dừng sớm, tránh lỗi ở các bước bên dưới khi fraud_df rỗng
 
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            kpi_card("Xảy ra vào ban đêm", f"{night_pct:.0f}%" if not np.isnan(night_pct) else "—", "22h–6h", kind="alert")
-        with c2:
-            kpi_card("Giao dịch trực tuyến", f"{online_pct:.0f}%" if not np.isnan(online_pct) else "—")
-        with c3:
-            kpi_card("Nhóm rủi ro Merchant cao", f"{high_tier_pct:.0f}%" if not np.isnan(high_tier_pct) else "—", kind="alert")
-        with c4:
-            kpi_card("Giao dịch ngoài khu vực phổ biến", f"{intl_pct:.0f}%" if not np.isnan(intl_pct) else "—")
+    total_fraud = len(fraud_df)
+    night_pct = fraud_df["is_night"].mean() * 100 if "is_night" in fraud_df.columns else np.nan
+    online_pct = fraud_df["is_online"].mean() * 100 if "is_online" in fraud_df.columns else np.nan
+    intl_pct = (
+        (fraud_df[country_col] != fraud_df[country_col].mode()[0]).mean() * 100
+        if country_col and country_col in fraud_df.columns
+        else np.nan
+    )
+    high_tier_pct = (
+        (fraud_df["category_risk_tier"] == "High").mean() * 100
+        if "category_risk_tier" in fraud_df.columns
+        else np.nan
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("Xảy ra vào ban đêm", f"{night_pct:.0f}%" if not np.isnan(night_pct) else "—", "22h–6h", kind="alert")
+    with c2:
+        kpi_card("Giao dịch trực tuyến", f"{online_pct:.0f}%" if not np.isnan(online_pct) else "—")
+    with c3:
+        kpi_card("Nhóm rủi ro Merchant cao", f"{high_tier_pct:.0f}%" if not np.isnan(high_tier_pct) else "—", kind="alert")
+    with c4:
+        kpi_card("Giao dịch ngoài khu vực phổ biến", f"{intl_pct:.0f}%" if not np.isnan(intl_pct) else "—")
 
     st.markdown("###")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Theo khung giờ**")
-        hd = fraud_df.dropna(subset=["_hour"]).copy() if len(fraud_df) else fraud_df
-        if len(hd):
+        # Kiểm tra cột _hour tồn tại và không toàn NaN trước khi dùng
+        if "_hour" in fraud_df.columns:
+            hd = fraud_df.dropna(subset=["_hour"]).copy()
+        else:
+            hd = pd.DataFrame()
+        if len(hd) > 0:
             hd["_hour_int"] = hd["_hour"].round().astype(int) % 24
             hc = hd["_hour_int"].value_counts().sort_index()
             fig = px.area(x=hc.index, y=hc.values, labels={"x": "Giờ", "y": "Số giao dịch"})
             fig.update_traces(line_color=ACCENT, fillcolor=f"{ACCENT}33")
             fig.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10))
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Không có dữ liệu giờ để hiển thị.")
     with c2:
         st.markdown("**Theo nhóm rủi ro Merchant (category_risk_tier)**")
-        if "category_risk_tier" in df_full.columns and len(fraud_df):
+        if "category_risk_tier" in fraud_df.columns:
             tier_c = fraud_df["category_risk_tier"].value_counts()
             fig = px.pie(values=tier_c.values, names=tier_c.index, hole=0.5)
             fig.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10))
             st.plotly_chart(fig, use_container_width=True)
+
+    # ──────────────────────────────────────────────────────────────────
+    # TỐI ƯU THRESHOLD THEO CHI PHÍ THỰC — theo đúng công thức Pipeline 2:
+    #   Tổng chi phí = Σ amt[FN] + cost_fp × số_FP
+    #   → tìm threshold tối thiểu hoá tổng chi phí này
+    # ──────────────────────────────────────────────────────────────────
+    if has_ground_truth:
+        st.markdown("###")
+        st.markdown("**Tối ưu ngưỡng cảnh báo theo chi phí thực tế (Cost-Sensitive Threshold)**")
+        st.caption(
+            "Công thức: **Tổng chi phí = Σ số tiền bị bỏ sót (FN) + chi phí xử lý nhầm × số FP** "
+            "— nhất quán với Pipeline 2 (LightGBM Cost-Sensitive)."
+        )
+
+        cost_fp_diag = st.slider(
+            "Chi phí xử lý 1 cảnh báo sai / FP (USD)", 0.5, 50.0,
+            float(st.session_state.cost_fp), 0.5,
+            key="diag_cost_fp"
+        )
+
+        label_arr_diag = df_full[label_col].astype(int).values
+        amount_arr_diag = df_full[amount_col].astype(float).values
+        prob_arr_diag   = df_full["fraud_probability"].values
+
+        # Tính đường cong chi phí trên lưới 99 điểm (giống pipeline 2: linspace 0.01→0.99)
+        thresholds_grid = np.round(np.linspace(0.01, 0.99, 99), 3)
+        total_costs = []
+        for t in thresholds_grid:
+            pred_t  = (prob_arr_diag >= t).astype(int)
+            fn_mask = (label_arr_diag == 1) & (pred_t == 0)
+            fp_mask = (label_arr_diag == 0) & (pred_t == 1)
+            total_costs.append(amount_arr_diag[fn_mask].sum() + cost_fp_diag * fp_mask.sum())
+        total_costs = np.array(total_costs)
+
+        best_idx        = int(np.argmin(total_costs))
+        best_threshold  = thresholds_grid[best_idx]
+        best_cost       = total_costs[best_idx]
+        default_idx     = int(np.argmin(np.abs(thresholds_grid - 0.5)))
+        default_cost    = total_costs[default_idx]
+        current_idx     = int(np.argmin(np.abs(thresholds_grid - st.session_state.threshold)))
+        current_cost    = total_costs[current_idx]
+        saving          = current_cost - best_cost
+        saving_pct      = (saving / current_cost * 100) if current_cost > 0 else 0
+
+        # Biểu đồ đường cong chi phí
+        fig_cost = go.Figure()
+        fig_cost.add_trace(go.Scatter(
+            x=thresholds_grid, y=total_costs,
+            mode="lines", line=dict(color=PRIMARY, width=3), name="Chi phí ước tính"
+        ))
+        fig_cost.add_vline(
+            x=best_threshold, line_dash="dot", line_color=ACCENT_GOOD,
+            annotation_text=f"Tối ưu: {best_threshold:.2f} (${best_cost:,.0f})",
+            annotation_font_color=ACCENT_GOOD,
+        )
+        fig_cost.add_vline(
+            x=st.session_state.threshold, line_dash="dash", line_color=ACCENT,
+            annotation_text=f"Hiện tại: {st.session_state.threshold:.2f} (${current_cost:,.0f})",
+            annotation_font_color=ACCENT,
+        )
+        fig_cost.update_layout(
+            height=360,
+            margin=dict(t=30, b=10, l=10, r=10),
+            xaxis_title="Ngưỡng phân loại (Threshold)",
+            yaxis_title="Tổng chi phí ước tính (USD)",
+        )
+        st.plotly_chart(fig_cost, use_container_width=True)
+
+        # So sánh KPI tại threshold hiện tại vs tối ưu
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        with kc1:
+            kpi_card("Threshold mặc định (0.5)", fmt_money(default_cost, currency, fx_rate), "Chi phí ước tính")
+        with kc2:
+            kpi_card("Threshold hiện tại", fmt_money(current_cost, currency, fx_rate),
+                     f"t = {st.session_state.threshold:.2f}")
+        with kc3:
+            kpi_card("Threshold tối ưu", fmt_money(best_cost, currency, fx_rate),
+                     f"t = {best_threshold:.2f}", kind="good")
+        with kc4:
+            kpi_card("Tiết kiệm ước tính", fmt_money(saving, currency, fx_rate),
+                     f"{saving_pct:.1f}% so với ngưỡng hiện tại", kind="good")
+
+        if saving > max(1.0, current_cost * 0.01):
+            st.markdown(
+                f"""<div class="reco-banner">
+                    <h3>💡 Khuyến nghị từ phân tích nguyên nhân</h3>
+                    <p>Dùng ngưỡng <b>{best_threshold:.2f}</b> thay cho <b>{st.session_state.threshold:.2f}</b>
+                    hiện tại — ước tính tiết kiệm <b>{fmt_money(saving, currency, fx_rate)}</b>
+                    ({saving_pct:.0f}% chi phí xử lý). Áp dụng tại trang "Quyết định chính sách".</p>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            if st.button(f"✅ Áp dụng ngưỡng tối ưu ({best_threshold:.2f}) ngay", key="diag_apply_threshold"):
+                st.session_state.threshold = float(best_threshold)
+                st.rerun()
+        else:
+            st.success(f"Ngưỡng hiện tại ({st.session_state.threshold:.2f}) đã gần mức tối ưu — chưa cần thay đổi.")
+    else:
+        st.markdown("###")
+        st.markdown(
+            """<div class="note-box">ℹ️ Tải thêm cột nhãn thực tế (<code>is_fraud</code>)
+            để xem phân tích tối ưu ngưỡng theo chi phí tại trang này.</div>""",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("###")
     st.markdown("**Các đặc trưng ảnh hưởng mạnh nhất tới quyết định của mô hình**")
