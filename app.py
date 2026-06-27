@@ -17,7 +17,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-BEST_THRESHOLD = 0.16  # ngưỡng tối ưu từ đồ án (0.16), không dùng giá trị trong pkl
+BEST_THRESHOLD = 0.16  # ngưỡng tối ưu 
 
 CATEGORY_RISK = {
     "shopping_net": 2, "misc_net": 2, "grocery_pos": 2,
@@ -264,19 +264,19 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Thông số mô hình**")
-    m = METRICS
+    def _f(key, default=0): return float(METRICS.get(key, default))
     st.markdown(f"""
 <div class="model-card">
 <p>Thuật toán: <b>LightGBM GBDT</b></p>
 <p>Số đặc trưng: <b>{len(FEATURE_COLS)}</b></p>
 <p>Threshold tối ưu: <b>{BEST_THRESHOLD}</b></p>
-<p>PR-AUC: <b>{float(m.get("pr_auc", 0)):.4f}</b></p>
-<p>PR-AUC 5-fold CV: <b>{float(m.get("cv_pr_auc_mean", 0)):.4f} ± {float(m.get("cv_pr_auc_std", 0)):.4f}</b></p>
-<p>ROC-AUC: <b>{float(m.get("roc_auc", 0)):.4f}</b></p>
-<p>Recall (số lượng): <b>{float(m.get("recall_count", 0))*100:.2f}%</b></p>
-<p>Recall (theo $): <b>{float(m.get("dollar_recall", 0)):.2f}%</b></p>
-<p>Precision (theo $): <b>{float(m.get("dollar_precision", 0)):.2f}%</b></p>
-<p>Chi phí ước tính: <b>${float(m.get("estimated_cost", 0)):,.0f}</b></p>
+<p>PR-AUC: <b>{_f("pr_auc"):.4f}</b></p>
+<p>PR-AUC 5-fold CV: <b>{_f("cv_pr_auc_mean"):.4f} ± {_f("cv_pr_auc_std"):.4f}</b></p>
+<p>ROC-AUC: <b>{_f("roc_auc"):.4f}</b></p>
+<p>Recall (số lượng): <b>{_f("recall_count")*100:.2f}%</b></p>
+<p>Recall (theo $): <b>{_f("dollar_recall"):.2f}%</b></p>
+<p>Precision (theo $): <b>{_f("dollar_precision"):.2f}%</b></p>
+<p>Chi phí ước tính: <b>${_f("estimated_cost"):,.0f}</b></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -319,20 +319,22 @@ with tab1:
         df_out = df_raw.copy()
         df_out["risk_score"] = np.round(proba, 4)
         df_out["fraud_pred"] = pred
-        # phân cấp dựa trên BEST_THRESHOLD:
-        # < threshold     → An toàn   (dưới ngưỡng phát hiện)
-        # threshold – 0.5 → Trung bình (trên ngưỡng, cần xem xét)
-        # >= 0.5          → Rất cao   (xác suất fraud rõ ràng)
-        MID = 0.5
-        df_out["risk_level"] = pd.cut(
-            proba,
-            bins=[-0.001, BEST_THRESHOLD, MID, 1.001],
-            labels=["🟢 An toàn", "🟡 Trung bình", "🔴 Rất cao"]
-        )
+        # risk_level và fraud_pred tính theo threshold từ sidebar
+        # (được cập nhật lại mỗi khi user kéo slider)
+        df_out["fraud_pred"] = (proba >= threshold).astype(int)
 
         # lưu session
         st.session_state["df_result"] = df_out
         st.session_state["proba"]     = proba
+
+        # ── tính risk_level động theo threshold hiện tại ──
+        MID = 0.5
+        df_out["fraud_pred"] = (proba >= threshold).astype(int)
+        df_out["risk_level"] = pd.cut(
+            proba,
+            bins=[-0.001, threshold, MID, 1.001],
+            labels=["🟢 An toàn", "🟡 Trung bình", "🔴 Rất cao"]
+        )
 
         # ── KPI ──────────────────────────────────────
         n        = len(df_out)
@@ -430,20 +432,17 @@ with tab1:
         # ── Bảng giao dịch ───────────────────────────
         st.markdown('<div class="sec">Danh sách giao dịch</div>', unsafe_allow_html=True)
 
-        f1, f2, f3 = st.columns(3)
+        f1, f2 = st.columns(2)
         only_fraud = f1.checkbox("Chỉ hiện giao dịch bị gắn cờ", value=True)
-        min_sc_f   = f2.slider("Risk score tối thiểu", 0.0, 1.0,
-                                float(threshold), 0.01, key="tbl_sc")
         cats = ["Tất cả"] + (
             sorted(df_out["category"].dropna().unique().tolist())
             if "category" in df_out.columns else []
         )
-        sel_cat = f3.selectbox("Lọc danh mục", cats)
+        sel_cat = f2.selectbox("Lọc danh mục", cats)
 
         df_show = df_out.copy()
         if only_fraud:
             df_show = df_show[df_show["fraud_pred"] == 1]
-        df_show = df_show[df_show["risk_score"] >= min_sc_f]
         if sel_cat != "Tất cả":
             df_show = df_show[df_show["category"] == sel_cat]
 
