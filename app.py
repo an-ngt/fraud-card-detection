@@ -17,7 +17,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-BEST_THRESHOLD = 0.16  # ngưỡng tối ưu 
+BEST_THRESHOLD = 0.16  # fallback, sẽ được ghi đè sau khi load model
 
 CATEGORY_RISK = {
     "shopping_net": 2, "misc_net": 2, "grocery_pos": 2,
@@ -139,6 +139,9 @@ CAT_COLS     = payload["categorical_features"]
 METRICS      = payload["eval_metrics"]
 FI_DF        = pd.DataFrame(payload["feature_importance"])
 
+# Lấy ngưỡng tối ưu từ pkl (ưu tiên), fallback về hằng số
+BEST_THRESHOLD = float(payload.get("best_threshold") or BEST_THRESHOLD)
+
 
 # ================================================================
 # FEATURE ENGINEERING — khớp đúng pipeline training
@@ -257,26 +260,37 @@ with st.sidebar:
         "Risk Score threshold",
         min_value=0.05, max_value=0.95,
         value=BEST_THRESHOLD, step=0.01,
-        help=f"Ngưỡng tối ưu từ đồ án: {BEST_THRESHOLD} "
-             f"(tối thiểu hóa tổng chi phí, chi phí cảnh báo sai = $5/GD)"
+        help=f"Ngưỡng tối ưu từ đồ án: {BEST_THRESHOLD:.2f} "
+             f"(tối thiểu hóa tổng chi phí trên tập kiểm tra)"
     )
-    st.caption(f"Ngưỡng tối ưu từ training: **{BEST_THRESHOLD}**")
+    st.caption(f"Ngưỡng tối ưu từ training: **{BEST_THRESHOLD:.2f}**")
+
+    st.divider()
+    st.markdown("**Chi phí cảnh báo sai (FP)**")
+    fp_cost = st.slider(
+        "Phí xử lý mỗi cảnh báo sai ($)",
+        min_value=1, max_value=50,
+        value=5, step=1,
+        help="Chi phí phát sinh khi hệ thống gắn cờ nhầm một giao dịch hợp lệ "
+             "(chi phí xem xét thủ công, liên hệ khách hàng, v.v.)"
+    )
+    st.caption(f"FP cost hiện tại: **${fp_cost}/GD**")
 
     st.divider()
     st.markdown("**Thông số mô hình**")
-    def _f(key, default=0): return float(METRICS.get(key, default))
+    def _f(key, default=0.0): return float(METRICS.get(key, default))
     st.markdown(f"""
 <div class="model-card">
 <p>Thuật toán: <b>LightGBM GBDT</b></p>
 <p>Số đặc trưng: <b>{len(FEATURE_COLS)}</b></p>
-<p>Threshold tối ưu: <b>{BEST_THRESHOLD}</b></p>
+<p>Threshold tối ưu: <b>{BEST_THRESHOLD:.2f}</b></p>
 <p>PR-AUC: <b>{_f("pr_auc"):.4f}</b></p>
 <p>PR-AUC 5-fold CV: <b>{_f("cv_pr_auc_mean"):.4f} ± {_f("cv_pr_auc_std"):.4f}</b></p>
 <p>ROC-AUC: <b>{_f("roc_auc"):.4f}</b></p>
 <p>Recall (số lượng): <b>{_f("recall_count")*100:.2f}%</b></p>
 <p>Recall (theo $): <b>{_f("dollar_recall"):.2f}%</b></p>
 <p>Precision (theo $): <b>{_f("dollar_precision"):.2f}%</b></p>
-<p>Chi phí ước tính: <b>${_f("estimated_cost"):,.0f}</b></p>
+<p>Chi phí ước tính (training): <b>${_f("estimated_cost"):,.0f}</b></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -328,13 +342,23 @@ with tab1:
         st.session_state["proba"]     = proba
 
         # ── tính risk_level động theo threshold hiện tại ──
-        MID = 0.5
+        # Bins: [0, threshold) → An toàn, [threshold, max(threshold,0.5)) → Trung bình, còn lại → Rất cao
+        # Xử lý đúng khi threshold >= 0.5
         df_out["fraud_pred"] = (proba >= threshold).astype(int)
-        df_out["risk_level"] = pd.cut(
-            proba,
-            bins=[-0.001, threshold, MID, 1.001],
-            labels=["🟢 An toàn", "🟡 Trung bình", "🔴 Rất cao"]
-        )
+        mid_bound = max(threshold, 0.5)
+        if threshold >= 0.5:
+            # Chỉ có 2 mức: An toàn và Rất cao
+            df_out["risk_level"] = pd.cut(
+                proba,
+                bins=[-0.001, threshold, 1.001],
+                labels=["🟢 An toàn", "🔴 Rất cao"]
+            )
+        else:
+            df_out["risk_level"] = pd.cut(
+                proba,
+                bins=[-0.001, threshold, 0.5, 1.001],
+                labels=["🟢 An toàn", "🟡 Trung bình", "🔴 Rất cao"]
+            )
 
         # ── KPI ──────────────────────────────────────
         n        = len(df_out)
@@ -366,44 +390,54 @@ with tab1:
         ca, cb = st.columns([3, 2])
 
         with ca:
-            # Scatter: amt vs risk_score
-            samp = df_out.sample(min(800, len(df_out)), random_state=1)
-            color_map = samp["fraud_pred"].map({0: "Hợp lệ", 1: "Gian lận"})
-            fig_sc = px.scatter(
-                samp,
-                x="amt" if "amt" in samp.columns else samp.index,
-                y="risk_score",
-                color=color_map,
-                color_discrete_map={"Hợp lệ": "#93c5fd", "Gian lận": "#f87171"},
-                opacity=0.65,
-                labels={"amt": "Số tiền ($)", "risk_score": "Risk Score", "color": ""},
-                title="Risk Score theo Số tiền giao dịch",
-            )
-            fig_sc.add_hline(
-                y=threshold, line_dash="dash", line_color="#f59e0b",
-                annotation_text=f"Threshold {threshold}",
+            # Histogram phân bố risk score theo nhãn thực (nếu có cột is_fraud/fraud)
+            true_col = next((c for c in ["is_fraud", "fraud", "label"] if c in df_out.columns), None)
+            if true_col:
+                fig_hist = go.Figure()
+                for val, name, color in [(0, "Hợp lệ", "#93c5fd"), (1, "Gian lận", "#f87171")]:
+                    mask = df_out[true_col] == val
+                    fig_hist.add_trace(go.Histogram(
+                        x=proba[mask], name=name,
+                        nbinsx=50, opacity=0.7,
+                        marker_color=color,
+                    ))
+                fig_hist.update_layout(barmode="overlay")
+            else:
+                fig_hist = go.Figure()
+                fig_hist.add_trace(go.Histogram(
+                    x=proba, nbinsx=50, name="Risk Score",
+                    marker_color="#93c5fd", opacity=0.8,
+                ))
+
+            fig_hist.add_vline(
+                x=threshold, line_dash="dash", line_color="#f59e0b", line_width=2,
+                annotation_text=f"Threshold = {threshold:.2f}",
                 annotation_position="top right",
+                annotation_font_color="#92400e",
             )
-            fig_sc.update_layout(
+            fig_hist.update_layout(
                 template="plotly_white", height=310,
-                margin=dict(t=40, b=30, l=10, r=10),
-                legend=dict(title="", orientation="h", y=1.1),
+                title="Phân bố Risk Score (histogram)",
                 title_font_size=13,
+                margin=dict(t=40, b=30, l=10, r=10),
+                xaxis_title="Risk Score", yaxis_title="Số lượng GD",
+                legend=dict(title="", orientation="h", y=1.12),
             )
-            st.plotly_chart(fig_sc, use_container_width=True)
+            st.plotly_chart(fig_hist, use_container_width=True)
 
         with cb:
             # Pie: risk level
             rc = df_out["risk_level"].value_counts().reset_index()
             rc.columns = ["level", "count"]
+            color_map_pie = {
+                "🟢 An toàn":    "#86efac",
+                "🟡 Trung bình": "#fcd34d",
+                "🔴 Rất cao":    "#f87171",
+            }
             fig_pie = px.pie(
                 rc, names="level", values="count", hole=0.45,
                 color="level",
-                color_discrete_map={
-                    "🟢 An toàn":    "#86efac",
-                    "🟡 Trung bình": "#fcd34d",
-                    "🔴 Rất cao":    "#f87171",
-                },
+                color_discrete_map=color_map_pie,
                 title="Phân bố mức độ rủi ro",
             )
             fig_pie.update_layout(
@@ -413,6 +447,90 @@ with tab1:
                 title_font_size=13,
             )
             st.plotly_chart(fig_pie, use_container_width=True)
+
+        # ── Phân tích ngưỡng tối ưu (minimize estimated cost) ──
+        st.markdown('<div class="sec">Phân tích ngưỡng & Thiệt hại ước tính</div>',
+                    unsafe_allow_html=True)
+
+        # Tính cost ước tính tại từng threshold (dùng dữ liệu hiện tại)
+        # Cost = FN_loss + FP_cost
+        # Nếu không có nhãn thực → dùng heuristic: FP dựa trên số GD bị gắn cờ, FN ước từ risk score cao bị bỏ
+        thresholds_range = np.arange(0.05, 0.96, 0.01)
+        has_true = "is_fraud" in df_out.columns or "fraud" in df_out.columns
+        true_col2 = next((c for c in ["is_fraud", "fraud", "label"] if c in df_out.columns), None)
+        amt_arr = df_out["amt"].values if "amt" in df_out.columns else np.ones(len(proba))
+
+        cost_list = []
+        for thr in thresholds_range:
+            pred_thr = (proba >= thr).astype(int)
+            if true_col2:
+                y_true = df_out[true_col2].values
+                fp = int(((pred_thr == 1) & (y_true == 0)).sum())
+                fn_loss = float(amt_arr[((pred_thr == 0) & (y_true == 1))].sum())
+            else:
+                # Heuristic khi không có nhãn: FP ≈ giao dịch bị cờ * (1 - avg precision proxy)
+                # FN_loss ≈ tổng tiền có score trong [thr-0.1, thr) (nguy cơ bị bỏ lọt nếu threshold tăng)
+                fp = int((pred_thr == 1).sum())
+                fn_loss = float(amt_arr[proba >= thr].sum() * (1 - thr))  # proxy
+            fp_loss = fp * fp_cost
+            cost_list.append({"threshold": round(thr, 2), "total_cost": fp_loss + fn_loss,
+                               "fp_cost_total": fp_loss, "fn_loss": fn_loss})
+
+        cost_df = pd.DataFrame(cost_list)
+        opt_idx = cost_df["total_cost"].idxmin()
+        opt_thr = cost_df.loc[opt_idx, "threshold"]
+        opt_cost = cost_df.loc[opt_idx, "total_cost"]
+
+        fig_cost = go.Figure()
+        fig_cost.add_trace(go.Scatter(
+            x=cost_df["threshold"], y=cost_df["total_cost"],
+            mode="lines", name="Tổng thiệt hại ước tính",
+            line=dict(color="#2563eb", width=2),
+        ))
+        fig_cost.add_trace(go.Scatter(
+            x=cost_df["threshold"], y=cost_df["fp_cost_total"],
+            mode="lines", name=f"Chi phí FP (${fp_cost}/GD)",
+            line=dict(color="#f59e0b", width=1.5, dash="dot"),
+        ))
+        fig_cost.add_trace(go.Scatter(
+            x=cost_df["threshold"], y=cost_df["fn_loss"],
+            mode="lines", name="Thiệt hại FN (bỏ lọt)",
+            line=dict(color="#f87171", width=1.5, dash="dot"),
+        ))
+        fig_cost.add_vline(
+            x=threshold, line_dash="dash", line_color="#6b7280", line_width=1.5,
+            annotation_text=f"Hiện tại: {threshold:.2f}",
+            annotation_position="top left", annotation_font_color="#374151",
+        )
+        fig_cost.add_vline(
+            x=opt_thr, line_dash="dash", line_color="#16a34a", line_width=2,
+            annotation_text=f"Tối ưu: {opt_thr:.2f}",
+            annotation_position="top right", annotation_font_color="#166534",
+        )
+        fig_cost.update_layout(
+            template="plotly_white", height=300,
+            title=f"Thiệt hại ước tính theo ngưỡng  |  Tối ưu tại threshold = {opt_thr:.2f}  (cost ≈ ${opt_cost:,.0f})",
+            title_font_size=13,
+            margin=dict(t=45, b=30, l=10, r=10),
+            xaxis_title="Threshold", yaxis_title="Chi phí ước tính ($)",
+            legend=dict(orientation="h", y=1.15),
+        )
+        st.plotly_chart(fig_cost, use_container_width=True)
+
+        if not has_true:
+            st.caption(
+                "ℹ️ Dữ liệu upload không có nhãn thực (`is_fraud`). "
+                "Đường cost dùng heuristic proxy — thêm cột `is_fraud` để có kết quả chính xác."
+            )
+        if abs(opt_thr - threshold) > 0.02:
+            st.info(
+                f"💡 Với FP cost = **${fp_cost}/GD**, ngưỡng tối thiểu hóa thiệt hại là "
+                f"**{opt_thr:.2f}** (đang chọn: {threshold:.2f}). "
+                f"Kéo slider sidebar về **{opt_thr:.2f}** để tối ưu."
+            )
+        else:
+            st.success(f"✅ Ngưỡng hiện tại **{threshold:.2f}** đã gần với mức tối ưu ({opt_thr:.2f}).")
+
 
         # Feature importance
         st.markdown('<div class="sec">Tầm quan trọng đặc trưng (Information Gain)</div>',
@@ -453,8 +571,8 @@ with tab1:
 
         def highlight(row):
             s = row.get("risk_score", 0)
-            if s >= 0.5:             return ["background-color:#fef2f2"] * len(row)
-            if s >= BEST_THRESHOLD:  return ["background-color:#fffbeb"] * len(row)
+            if s >= 0.5:         return ["background-color:#fef2f2"] * len(row)
+            if s >= threshold:   return ["background-color:#fffbeb"] * len(row)
             return [""] * len(row)
 
         fmt = {k: v for k, v in
@@ -513,10 +631,11 @@ with tab2:
 
             # banner mức rủi ro
             # ngưỡng phân cấp khớp với risk_level ở Tab 1
-            if score >= 0.5:
+            high_bound = max(threshold, 0.5)
+            if score >= high_bound:
                 css, icon, lbl = "a-hi", "🔴", "RẤT CAO"
                 rec = "**Tự động tạm khóa giao dịch** — Gửi OTP cảnh báo khẩn đến chủ thẻ, chuyển hồ sơ sang đội kiểm soát ưu tiên 1."
-            elif score >= BEST_THRESHOLD:
+            elif score >= threshold:
                 css, icon, lbl = "a-md", "🟡", "TRUNG BÌNH"
                 rec = "**Kích hoạt xác thực mạnh (2FA)** — Tăng cường giám sát, đặc biệt nếu danh mục rủi ro cao hoặc giao dịch ban đêm."
             else:
@@ -533,7 +652,7 @@ with tab2:
             # gauge + thông tin
             cg, ci = st.columns([1, 2])
             with cg:
-                bar_color = "#dc2626" if score >= 0.5 else "#f59e0b" if score >= BEST_THRESHOLD else "#16a34a"
+                bar_color = "#dc2626" if score >= max(threshold, 0.5) else "#f59e0b" if score >= threshold else "#16a34a"
                 fig_g = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=score * 100,
@@ -542,9 +661,9 @@ with tab2:
                         "axis": {"range": [0, 100], "tickfont": {"color": "#374151"}},
                         "bar":  {"color": bar_color},
                         "steps": [
-                            {"range": [0,  16.0],  "color": "#f0fdf4"},
-                            {"range": [16.0, 50], "color": "#fffbeb"},
-                            {"range": [50, 100], "color": "#fef2f2"},
+                            {"range": [0,  threshold * 100],           "color": "#f0fdf4"},
+                            {"range": [threshold * 100, max(threshold * 100, 50)], "color": "#fffbeb"},
+                            {"range": [max(threshold * 100, 50), 100], "color": "#fef2f2"},
                         ],
                         "threshold": {
                             "line":  {"color": "#1e40af", "width": 3},
@@ -648,9 +767,9 @@ with tab2:
 
             # ── Khuyến nghị ────────────────────────────
             st.markdown('<div class="sec">Khuyến nghị xử lý</div>', unsafe_allow_html=True)
-            if score >= 0.5:
+            if score >= high_bound:
                 st.error(rec)
-            elif score >= BEST_THRESHOLD:
+            elif score >= threshold:
                 st.warning(rec)
             else:
                 st.success(rec)
