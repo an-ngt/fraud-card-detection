@@ -903,8 +903,14 @@ def page_diagnostic():
         if len(hd) > 0:
             hd["_hour_int"] = hd["_hour"].round().astype(int) % 24
             hc = hd["_hour_int"].value_counts().sort_index()
+            # px.area trả về Scatter với fill='tozeroy' — fillcolor phải là chuỗi rgba, KHÔNG phải hex
+            # (Plotly validator từ chối hex string cho fillcolor của Scatter)
+            r, g, b = int(ACCENT[1:3], 16), int(ACCENT[3:5], 16), int(ACCENT[5:7], 16)
             fig = px.area(x=hc.index, y=hc.values, labels={"x": "Giờ", "y": "Số giao dịch"})
-            fig.update_traces(line_color=ACCENT, fillcolor=f"{ACCENT}33")
+            fig.update_traces(
+                line=dict(color=ACCENT),
+                fillcolor=f"rgba({r},{g},{b},0.15)"
+            )
             fig.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10))
             st.plotly_chart(fig, use_container_width=True)
         else:
@@ -930,17 +936,45 @@ def page_diagnostic():
             "— nhất quán với Pipeline 2 (LightGBM Cost-Sensitive)."
         )
 
-        cost_fp_diag = st.slider(
-            "Chi phí xử lý 1 cảnh báo sai / FP (USD)", 0.5, 50.0,
-            float(st.session_state.cost_fp), 0.5,
-            key="diag_cost_fp"
-        )
-
-        label_arr_diag = df_full[label_col].astype(int).values
+        label_arr_diag  = df_full[label_col].astype(int).values
         amount_arr_diag = df_full[amount_col].astype(float).values
         prob_arr_diag   = df_full["fraud_probability"].values
 
-        # Tính đường cong chi phí trên lưới 99 điểm (giống pipeline 2: linspace 0.01→0.99)
+        # ── Tại sao cần auto-scale cost_fp? ──────────────────────────────────
+        # Pipeline 2 dùng COST_PER_FALSE_ALARM = 5 USD trên tập ~1.3M dòng với
+        # hàng trăm nghìn FP có thể xảy ra → FP chiếm phần đáng kể tổng chi
+        # phí → đường cong có hình chữ U rõ ràng.
+        # Trên tập inference nhỏ hơn, số FP ít hơn nhiều, nên nếu giữ nguyên
+        # 5 USD tuyệt đối thì FN (mỗi cái = vài trăm USD) luôn thắng áp đảo
+        # → đường cong chỉ tăng đơn điệu, không có điểm uốn.
+        # Giải pháp: biểu diễn cost_fp theo % median amt fraud — scale tự động
+        # theo phân phối của tập dữ liệu hiện tại, giữ nguyên ý nghĩa kinh tế.
+        fraud_idxs = label_arr_diag == 1
+        fraud_amt_median = float(np.median(amount_arr_diag[fraud_idxs])) if fraud_idxs.sum() > 0 else 100.0
+        fraud_amt_median = max(fraud_amt_median, 1.0)
+
+        cost_fp_pct = st.slider(
+            "Chi phí xử lý 1 FP (% so với trung vị giá trị fraud)",
+            min_value=1, max_value=200, value=10, step=1,
+            key="diag_cost_fp",
+            help=(
+                f"Trung vị amt fraud trong tập này ≈ ${fraud_amt_median:,.0f}. "
+                f"Ví dụ: 10% → ${fraud_amt_median*0.10:,.0f}/FP. "
+                f"Pipeline 2 dùng $5/FP = tương đương {5/fraud_amt_median*100:.1f}% tập train."
+            )
+        )
+        cost_fp_diag = fraud_amt_median * cost_fp_pct / 100.0
+        st.caption(
+            f"→ Chi phí FP hiệu dụng: **${cost_fp_diag:,.2f}** / cảnh báo sai "
+            f"(trung vị amt fraud = ${fraud_amt_median:,.0f}, tỷ lệ {cost_fp_pct}%)"
+        )
+
+        # Tính đường cong chi phí trên lưới 99 điểm — nhất quán với Pipeline 2
+        # Công thức: Tổng_chi_phí(t) = Σ amt[FN] + cost_fp × #FP
+        # Với cost_fp được scale hợp lý → đường cong luôn có hình chữ U:
+        #   threshold thấp  → nhiều FP → chi phí FP lớn
+        #   threshold cao   → nhiều FN → chi phí FN lớn (tiền bị bỏ sót)
+        #   điểm giữa tối ưu → cân bằng hai loại chi phí
         thresholds_grid = np.round(np.linspace(0.01, 0.99, 99), 3)
         total_costs = []
         for t in thresholds_grid:
