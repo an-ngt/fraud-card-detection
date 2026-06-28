@@ -167,7 +167,7 @@ def generate_demo_data(n=6000, seed=42):
     df["hour"] = hour
     df["sin_hour"] = np.sin(2 * np.pi * hour / 24)
     df["cos_hour"] = np.cos(2 * np.pi * hour / 24)
-    df["is_night"] = ((hour >= 22) | (hour < 6)).astype(int)
+    df["is_night"] = ((hour >= 22) | (hour <= 3)).astype(int)
     df["is_online"] = rng.integers(0, 2, n)
     df["age"] = rng.integers(18, 75, n)
     df["gender"] = rng.choice(["F", "M"], n)
@@ -305,15 +305,15 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
             df["cos_hour"] = np.cos(2 * np.pi * df["trans_hour"] / 24)
             notes.append("Đã tính `sin_hour`/`cos_hour` (Circular Encoding).")
 
-    # is_night: 22h–3h (định nghĩa trong Cell 10, cập nhật lại từ Cell 8)
+    # is_night: 22h–3h (Cell 10 notebook — định nghĩa cuối cùng dùng khi train: hour >= 22 OR hour <= 3)
     if "is_night" not in df.columns:
         if "trans_hour" in df.columns:
             df["is_night"] = ((df["trans_hour"] >= 22) | (df["trans_hour"] <= 3)).astype(int)
-            notes.append("Đã tính `is_night` (22h–3h sáng = ban đêm).")
+            notes.append("Đã tính `is_night` (22h–3h = ban đêm, theo Cell 10 notebook).")
         elif "sin_hour" in df.columns and "cos_hour" in df.columns:
             hr = (np.degrees(np.arctan2(df["sin_hour"], df["cos_hour"])) / 15.0) % 24
             df["is_night"] = ((hr >= 22) | (hr <= 3)).astype(int)
-            notes.append("Đã suy ra `is_night` từ `sin_hour`/`cos_hour`.")
+            notes.append("Đã suy ra `is_night` từ `sin_hour`/`cos_hour` (22h–3h).")
 
     # is_online: category chứa chữ 'net' (Cell 10)
     if "is_online" not in df.columns:
@@ -363,16 +363,25 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
     if "amt_log_x_is_night" not in df.columns and {"amt_log", "is_night"}.issubset(df.columns):
         df["amt_log_x_is_night"] = df["amt_log"] * df["is_night"]
 
-    # merchant_freq — count tuyệt đối (Cell 26)
+    # merchant_freq — tần suất tương đối (tỷ lệ % trong tập hiện tại)
+    # Notebook tính count tuyệt đối trên tập train ~1.3M dòng. Khi inference trên tập
+    # nhỏ hơn, count tuyệt đối bị distribution shift nặng (merchant xuất hiện 500 lần
+    # trong train chỉ còn 50 lần trong tập upload). Dùng tần suất tương đối
+    # (count / total) thay thế: giữ nguyên thứ tự xếp hạng của các merchant và
+    # ổn định hơn giữa các tập dữ liệu có kích thước khác nhau.
     if "merchant_freq" not in df.columns:
         merch_col_raw = find_col(df, ["merchant"])
         if merch_col_raw:
+            n_rows = max(len(df), 1)
             freq_map = df[merch_col_raw].value_counts()
-            df["merchant_freq"] = df[merch_col_raw].map(freq_map).fillna(1)
-            notes.append("Đã tính `merchant_freq` (số lần xuất hiện của mỗi merchant).")
+            df["merchant_freq"] = df[merch_col_raw].map(freq_map).fillna(1) / n_rows
+            notes.append(
+                "Đã tính `merchant_freq` (tần suất tương đối = count/total) "
+                "— giảm distribution shift so với count tuyệt đối khi tập inference nhỏ hơn tập train."
+            )
         else:
-            df["merchant_freq"] = 1
-            notes.append("⚠️ Thiếu `merchant` — `merchant_freq` gán 1.")
+            df["merchant_freq"] = 1.0 / max(len(df), 1)
+            notes.append("⚠️ Thiếu `merchant` — `merchant_freq` gán 1/n.")
 
     # gender mặc định
     if "gender" not in df.columns:
@@ -589,7 +598,24 @@ with st.sidebar:
         st.warning("Chưa có mô hình. Vui lòng tải file .pkl.")
 
     st.markdown("**2. Dữ liệu giao dịch**")
-    data_file = st.file_uploader("Tải dữ liệu (.csv)", type=["csv"], label_visibility="collapsed")
+    data_file = st.file_uploader(
+        "Tải dữ liệu (.csv) — tối đa 200 MB",
+        type=["csv"],
+        label_visibility="collapsed",
+        help="File > 200 MB: dùng ô 'Đường dẫn file' bên dưới hoặc giảm kích thước bằng cách lọc cột.",
+    )
+    # Workaround cho file > 200 MB: nhập đường dẫn tuyệt đối trên máy local
+    # (chỉ hoạt động khi chạy `streamlit run app.py` trực tiếp, không phải cloud)
+    local_path_input = st.text_input(
+        "📁 Hoặc nhập đường dẫn file CSV trên máy (nếu > 200 MB)",
+        value="",
+        placeholder="Ví dụ: C:/Users/An/data/transactions.csv",
+        help=(
+            "Streamlit giới hạn upload 200 MB. Với file lớn hơn, "
+            "nhập đường dẫn đầy đủ tới file CSV. Chỉ hoạt động khi "
+            "chạy app trực tiếp trên máy (streamlit run app.py)."
+        ),
+    )
     use_demo = st.button("📊 Dùng dữ liệu mẫu để thử nghiệm", use_container_width=True)
 
     st.markdown("---")
@@ -619,10 +645,34 @@ if "demo_mode" not in st.session_state:
 if use_demo:
     st.session_state.demo_mode = True
 
+@st.cache_data(show_spinner="Đang đọc file lớn theo từng khối...")
+def read_large_csv(path_or_bytes, is_path: bool = False):
+    """
+    Đọc CSV lớn bằng chunked reading để tránh OOM.
+    Với file > 200 MB qua đường dẫn local, đọc theo chunks 50 MB.
+    """
+    if is_path:
+        chunks = pd.read_csv(path_or_bytes, chunksize=200_000, low_memory=False)
+        return pd.concat(chunks, ignore_index=True)
+    else:
+        # file_uploader bytes — đọc trực tiếp (đã < 200 MB)
+        return pd.read_csv(io.BytesIO(path_or_bytes), low_memory=False)
+
+
 raw_df = None
 if data_file is not None:
-    raw_df = pd.read_csv(data_file)
+    raw_df = read_large_csv(data_file.getvalue(), is_path=False)
     st.session_state.demo_mode = False
+elif local_path_input.strip():
+    p = Path(local_path_input.strip())
+    if p.exists() and p.suffix.lower() == ".csv":
+        try:
+            raw_df = read_large_csv(str(p), is_path=True)
+            st.session_state.demo_mode = False
+        except Exception as e:
+            st.sidebar.error(f"Không đọc được file: {e}")
+    else:
+        st.sidebar.warning("Đường dẫn không tồn tại hoặc không phải file .csv.")
 elif st.session_state.demo_mode:
     raw_df = generate_demo_data()
 
@@ -845,6 +895,57 @@ def page_descriptive():
         fig = px.bar(x=online_counts.index, y=online_counts.values, color=online_counts.index)
         fig.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10), showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
+
+    # ── Thêm: tỷ lệ gian lận theo danh mục & ban đêm vs ban ngày (EDA Chapter 3) ──
+    if has_ground_truth:
+        st.markdown("###")
+        c5, c6 = st.columns(2)
+        with c5:
+            cat_col_desc = find_col(df_full, ["category", "merchant", "category_risk_tier"])
+            if cat_col_desc and cat_col_desc in df_full.columns:
+                st.markdown(f"**Tỷ lệ gian lận theo `{cat_col_desc}`** *(EDA – Hình 3.2)*")
+                fraud_rate_cat = (
+                    df_full.groupby(cat_col_desc)[label_col]
+                    .apply(lambda x: x.astype(int).mean() * 100)
+                    .sort_values(ascending=True)
+                )
+                fig = px.bar(
+                    x=fraud_rate_cat.values,
+                    y=fraud_rate_cat.index,
+                    orientation="h",
+                    labels={"x": "Tỷ lệ gian lận (%)", "y": ""},
+                )
+                fig.update_traces(marker_color=ACCENT)
+                fig.update_layout(height=max(280, len(fraud_rate_cat) * 28), margin=dict(t=10, b=10, l=10, r=10))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Không tìm thấy cột danh mục để thống kê tỷ lệ gian lận.")
+        with c6:
+            if "is_night" in df_full.columns:
+                st.markdown("**Tỷ lệ gian lận: ban đêm vs ban ngày** *(EDA – Bảng 3.4)*")
+                night_fraud = (
+                    df_full.groupby(df_full["is_night"].map({1: "Ban đêm (22h–3h)", 0: "Ban ngày"}))[label_col]
+                    .apply(lambda x: x.astype(int).mean() * 100)
+                    .reset_index()
+                )
+                night_fraud.columns = ["Khung giờ", "Tỷ lệ gian lận (%)"]
+                fig = px.bar(
+                    night_fraud,
+                    x="Khung giờ",
+                    y="Tỷ lệ gian lận (%)",
+                    color="Khung giờ",
+                    color_discrete_map={"Ban đêm (22h–3h)": ACCENT, "Ban ngày": PRIMARY},
+                    text_auto=".2f",
+                )
+                fig.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10), showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+                # Số liệu tóm tắt
+                day_rate = df_full[df_full["is_night"] == 0][label_col].astype(int).mean() * 100
+                night_rate = df_full[df_full["is_night"] == 1][label_col].astype(int).mean() * 100
+                if day_rate > 0:
+                    st.caption(f"Giao dịch ban đêm có tỷ lệ gian lận cao gấp **{night_rate/day_rate:.1f}×** ban ngày.")
+            else:
+                st.info("Không có cột `is_night` để so sánh ban đêm/ban ngày.")
 
 
 # ──────────────────────────────────────────────────────────────────────────
