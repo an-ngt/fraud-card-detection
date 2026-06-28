@@ -599,22 +599,10 @@ with st.sidebar:
 
     st.markdown("**2. Dữ liệu giao dịch**")
     data_file = st.file_uploader(
-        "Tải dữ liệu (.csv) — tối đa 200 MB",
+        "Tải dữ liệu (.csv) — tối đa 1 GB",
         type=["csv"],
         label_visibility="collapsed",
-        help="File > 200 MB: dùng ô 'Đường dẫn file' bên dưới hoặc giảm kích thước bằng cách lọc cột.",
-    )
-    # Workaround cho file > 200 MB: nhập đường dẫn tuyệt đối trên máy local
-    # (chỉ hoạt động khi chạy `streamlit run app.py` trực tiếp, không phải cloud)
-    local_path_input = st.text_input(
-        "📁 Hoặc nhập đường dẫn file CSV trên máy (nếu > 200 MB)",
-        value="",
-        placeholder="Ví dụ: C:/Users/An/data/transactions.csv",
-        help=(
-            "Streamlit giới hạn upload 200 MB. Với file lớn hơn, "
-            "nhập đường dẫn đầy đủ tới file CSV. Chỉ hoạt động khi "
-            "chạy app trực tiếp trên máy (streamlit run app.py)."
-        ),
+        help="Hỗ trợ file tới 1 GB nhờ config.toml. Nếu vẫn chậm, dùng slim_dataset.py để thu gọn file trước.",
     )
     use_demo = st.button("📊 Dùng dữ liệu mẫu để thử nghiệm", use_container_width=True)
 
@@ -645,37 +633,16 @@ if "demo_mode" not in st.session_state:
 if use_demo:
     st.session_state.demo_mode = True
 
-@st.cache_data(show_spinner="Đang đọc file lớn theo từng khối...")
-def read_large_csv(path_or_bytes, is_path: bool = False):
-    """
-    Đọc CSV lớn bằng chunked reading để tránh OOM.
-    Với file > 200 MB qua đường dẫn local, đọc theo chunks 50 MB.
-    """
-    if is_path:
-        chunks = pd.read_csv(path_or_bytes, chunksize=200_000, low_memory=False)
-        return pd.concat(chunks, ignore_index=True)
-    else:
-        # file_uploader bytes — đọc trực tiếp (đã < 200 MB)
-        return pd.read_csv(io.BytesIO(path_or_bytes), low_memory=False)
-
+@st.cache_data(show_spinner="Đang đọc file CSV...")
+def read_csv_upload(file_bytes):
+    return pd.read_csv(io.BytesIO(file_bytes), low_memory=False)
 
 raw_df = None
 if data_file is not None:
-    raw_df = read_large_csv(data_file.getvalue(), is_path=False)
+    raw_df = read_csv_upload(data_file.getvalue())
     st.session_state.demo_mode = False
-elif local_path_input.strip():
-    p = Path(local_path_input.strip())
-    if p.exists() and p.suffix.lower() == ".csv":
-        try:
-            raw_df = read_large_csv(str(p), is_path=True)
-            st.session_state.demo_mode = False
-        except Exception as e:
-            st.sidebar.error(f"Không đọc được file: {e}")
-    else:
-        st.sidebar.warning("Đường dẫn không tồn tại hoặc không phải file .csv.")
 elif st.session_state.demo_mode:
     raw_df = generate_demo_data()
-
 if bundle is None:
     st.title("🛡️ Hệ thống hỗ trợ ra quyết định phát hiện gian lận")
     st.info("👈 Vui lòng tải mô hình `.pkl` ở thanh bên để bắt đầu.")
