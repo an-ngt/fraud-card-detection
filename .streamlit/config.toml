@@ -1,0 +1,6 @@
+[server]
+# Tăng giới hạn upload lên 1 GB (mặc định Streamlit Cloud là 200 MB)
+maxUploadSize = 1024
+
+[theme]
+# Giữ theme mặc định — xóa section này nếu app đã tự set theme trong code
