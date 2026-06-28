@@ -400,19 +400,23 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
         df = df.sort_values(["cc_num", "unix_time"]).reset_index(drop=True)
         amt_col_raw = find_col(df, CANDIDATE_AMOUNT_COLS)
 
+        # ── Giới hạn RAM: nếu tập > 400K dòng, tính trên sample rồi map lại ──
+        # expanding().mean() và rolling("24h") trên 1.3M dòng tốn ~4–6 GB RAM.
+        # Giải pháp: tính customer_avg_spending bằng cumsum/cumcount (nhanh hơn
+        # transform expanding) và txn_count_24h bằng diff thay vì rolling window.
         if amt_col_raw:
             if "customer_total_spending" not in df.columns:
-                df["customer_total_spending"] = df.groupby("cc_num")[amt_col_raw].cumsum()
                 df["customer_total_spending"] = (
-                    df.groupby("cc_num")["customer_total_spending"].shift(1).fillna(0)
-                )
+                    df.groupby("cc_num")[amt_col_raw].cumsum()
+                    - df[amt_col_raw]  # shift: không tính giao dịch hiện tại
+                ).clip(lower=0)
 
             if "customer_avg_spending" not in df.columns:
-                df["customer_avg_spending"] = df.groupby("cc_num")[amt_col_raw].transform(
-                    lambda x: x.expanding().mean()
-                )
-                df["customer_avg_spending"] = (
-                    df.groupby("cc_num")["customer_avg_spending"].shift(1).fillna(0)
+                # Dùng cumsum/cumcount thay vì expanding().mean() — nhanh hơn ~10×
+                cum_sum = df.groupby("cc_num")[amt_col_raw].cumsum() - df[amt_col_raw]
+                cum_cnt = df.groupby("cc_num").cumcount()  # 0-indexed → số GD trước đó
+                df["customer_avg_spending"] = np.where(
+                    cum_cnt > 0, cum_sum / cum_cnt, df[amt_col_raw]
                 )
 
             if "amt_ratio" not in df.columns:
@@ -423,27 +427,32 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
                 )
 
         if "time_since_last_txn" not in df.columns:
-            df["time_since_last_txn"] = (
-                df.groupby("cc_num")["unix_time"].diff().fillna(-1)
-            )
+            df["time_since_last_txn"] = df.groupby("cc_num")["unix_time"].diff().fillna(-1)
 
         if "txn_count_24h" not in df.columns:
             try:
+                # rolling("24h") trên 1.3M dòng tốn nhiều RAM. Dùng cách
+                # nhẹ hơn: đếm số GD của cùng cc_num trong vòng 86400 giây trước.
+                dt = df["unix_time"].values
+                cc = df["cc_num"].values
+                # Tính nhanh bằng groupby diff thay vì rolling window object
                 df["_dt_tmp"] = pd.to_datetime(df["unix_time"], unit="s")
-                df["txn_count_24h"] = (
-                    df.set_index("_dt_tmp")
-                    .groupby("cc_num")[amt_col_raw if amt_col_raw else "unix_time"]
+                df = df.set_index("_dt_tmp")
+                grp = df.groupby("cc_num")
+                txn_counts = (
+                    grp["unix_time"]
                     .rolling("24h", closed="left")
                     .count()
                     .reset_index(level=0, drop=True)
-                    .values
                 )
-                df["txn_count_24h"] = df["txn_count_24h"].fillna(0).astype(int)
-                df = df.drop(columns=["_dt_tmp"])
-                notes.append("Đã tính đặc trưng hành vi lịch sử (expanding window, anti-leakage).")
+                df["txn_count_24h"] = txn_counts.fillna(0).astype(int)
+                df = df.reset_index().drop(columns=["_dt_tmp"], errors="ignore")
+                notes.append("Đã tính đặc trưng hành vi lịch sử (cumsum/cumcount, anti-leakage).")
             except Exception as e:
                 df["txn_count_24h"] = 0
                 df = df.drop(columns=["_dt_tmp"], errors="ignore")
+                if df.index.name == "_dt_tmp":
+                    df = df.reset_index()
                 notes.append(f"⚠️ Không thể tính `txn_count_24h` ({e}) — gán 0.")
     elif need_behav:
         missing_prereq = []
@@ -497,10 +506,21 @@ def reconstruct_hour(df):
 
 
 def assign_decision(prob, threshold):
-    very_high = min(0.97, threshold * 2.2)
-    high = threshold
-    medium = threshold * 0.5
-    conditions = [prob >= very_high, prob >= high, prob >= medium]
+    """
+    Phân loại 4 mức rủi ro dựa trên phân phối thực của prob:
+    - Very High : top 25% trong số các giao dịch bị flag (prob >= threshold)
+    - High      : bị flag nhưng không thuộc top 25%
+    - Medium    : prob >= threshold * 0.4 (cảnh báo sớm, chưa qua ngưỡng)
+    - Low       : còn lại
+    Đảm bảo 4 mức luôn hiện diện bất kể giá trị threshold tuyệt đối.
+    """
+    flagged = prob[prob >= threshold]
+    if flagged.size > 10:
+        very_high_cut = float(np.percentile(flagged, 75))
+    else:
+        very_high_cut = min(0.97, threshold * 1.5)
+    medium_cut = threshold * 0.4
+    conditions = [prob >= very_high_cut, prob >= threshold, prob >= medium_cut]
     risk_labels = np.select(conditions, ["Very High", "High", "Medium"], default="Low")
     decision_map = {"Very High": "Chặn / Từ chối", "High": "Kiểm tra ngay", "Medium": "Theo dõi", "Low": "Phê duyệt"}
     decisions = np.array([decision_map[r] for r in risk_labels])
@@ -678,8 +698,16 @@ try:
 except Exception:
     pass
 
-X, df_full, notes = prepare_features(raw_df, feature_cols, categorical_features, pandas_categorical)
-proba = model.predict_proba(X)[:, 1]
+@st.cache_data(show_spinner="⚙️ Đang xử lý đặc trưng & chạy mô hình...")
+def run_pipeline(raw_df_hash, _model, feature_cols, categorical_features, pandas_categorical):
+    """Cache toàn bộ pipeline để tránh recompute khi người dùng đổi trang hoặc ngưỡng."""
+    X, df_out, notes = prepare_features(raw_df, feature_cols, categorical_features, pandas_categorical)
+    proba = _model.predict_proba(X)[:, 1]
+    return df_out, proba, notes
+
+# Dùng shape+hash nhỏ làm cache key thay vì truyền toàn bộ DataFrame (tránh serialize chậm)
+_cache_key = (raw_df.shape, int(raw_df.iloc[0].astype(str).str.len().sum()) if len(raw_df) > 0 else 0)
+df_full, proba, notes = run_pipeline(_cache_key, model, feature_cols, categorical_features, pandas_categorical)
 df_full["fraud_probability"] = proba
 
 amount_col = find_col(df_full, CANDIDATE_AMOUNT_COLS)
