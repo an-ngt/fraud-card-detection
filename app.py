@@ -931,10 +931,7 @@ def page_diagnostic():
     if has_ground_truth:
         st.markdown("###")
         st.markdown("**Tối ưu ngưỡng cảnh báo theo chi phí thực tế (Cost-Sensitive Threshold)**")
-        st.caption(
-            "Công thức: **Tổng chi phí = Σ số tiền bị bỏ sót (FN) + chi phí xử lý nhầm × số FP** "
-            "— nhất quán với Pipeline 2 (LightGBM Cost-Sensitive)."
-        )
+
 
         label_arr_diag  = df_full[label_col].astype(int).values
         amount_arr_diag = df_full[amount_col].astype(float).values
@@ -955,10 +952,6 @@ def page_diagnostic():
 
         COST_FP_FIXED = 5.0  # nhất quán với Pipeline 2 (lightgbm.py)
         cost_fp_diag = COST_FP_FIXED
-        st.caption(
-            f"→ Chi phí FP: **${cost_fp_diag:,.2f}** / cảnh báo sai "
-            f"— nhất quán với Pipeline 2 (COST_PER_FALSE_ALARM = $5)."
-        )
 
         # Tính đường cong chi phí trên lưới 99 điểm — nhất quán với Pipeline 2
         # Công thức: Tổng_chi_phí(t) = Σ amt[FN] + cost_fp × #FP
@@ -1048,7 +1041,6 @@ def page_diagnostic():
 
     st.markdown("###")
     st.markdown("**Các đặc trưng ảnh hưởng mạnh nhất tới quyết định của mô hình**")
-    st.caption("Information Gain — mức độ đặc trưng giúp mô hình phân biệt giao dịch gian lận / hợp lệ.")
     fi = bundle.get("feature_importance")
     if fi:
         fi_df = pd.DataFrame(fi).sort_values("gain", ascending=True).tail(15)
