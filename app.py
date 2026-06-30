@@ -881,15 +881,14 @@ def page_diagnostic():
         else np.nan
     )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1:
         kpi_card("Xảy ra vào ban đêm", f"{night_pct:.0f}%" if not np.isnan(night_pct) else "—", "22h–3h", kind="alert")
     with c2:
         kpi_card("Giao dịch trực tuyến", f"{online_pct:.0f}%" if not np.isnan(online_pct) else "—")
     with c3:
         kpi_card("Nhóm rủi ro Merchant cao", f"{high_tier_pct:.0f}%" if not np.isnan(high_tier_pct) else "—", kind="alert")
-    with c4:
-        kpi_card("Giao dịch ngoài khu vực phổ biến", f"{intl_pct:.0f}%" if not np.isnan(intl_pct) else "—")
+
 
     st.markdown("###")
     c1, c2 = st.columns(2)
