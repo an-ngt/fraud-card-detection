@@ -167,7 +167,7 @@ def generate_demo_data(n=6000, seed=42):
     df["hour"] = hour
     df["sin_hour"] = np.sin(2 * np.pi * hour / 24)
     df["cos_hour"] = np.cos(2 * np.pi * hour / 24)
-    df["is_night"] = ((hour >= 22) | (hour <= 3)).astype(int)
+    df["is_night"] = ((hour >= 22) | (hour < 6)).astype(int)
     df["is_online"] = rng.integers(0, 2, n)
     df["age"] = rng.integers(18, 75, n)
     df["gender"] = rng.choice(["F", "M"], n)
@@ -305,15 +305,15 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
             df["cos_hour"] = np.cos(2 * np.pi * df["trans_hour"] / 24)
             notes.append("Đã tính `sin_hour`/`cos_hour` (Circular Encoding).")
 
-    # is_night: 22h–3h (Cell 10 notebook — định nghĩa cuối cùng dùng khi train: hour >= 22 OR hour <= 3)
+    # is_night: 22h–3h (định nghĩa trong Cell 10, cập nhật lại từ Cell 8)
     if "is_night" not in df.columns:
         if "trans_hour" in df.columns:
             df["is_night"] = ((df["trans_hour"] >= 22) | (df["trans_hour"] <= 3)).astype(int)
-            notes.append("Đã tính `is_night` (22h–3h = ban đêm, theo Cell 10 notebook).")
+            notes.append("Đã tính `is_night` (22h–3h sáng = ban đêm).")
         elif "sin_hour" in df.columns and "cos_hour" in df.columns:
             hr = (np.degrees(np.arctan2(df["sin_hour"], df["cos_hour"])) / 15.0) % 24
             df["is_night"] = ((hr >= 22) | (hr <= 3)).astype(int)
-            notes.append("Đã suy ra `is_night` từ `sin_hour`/`cos_hour` (22h–3h).")
+            notes.append("Đã suy ra `is_night` từ `sin_hour`/`cos_hour`.")
 
     # is_online: category chứa chữ 'net' (Cell 10)
     if "is_online" not in df.columns:
@@ -363,25 +363,16 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
     if "amt_log_x_is_night" not in df.columns and {"amt_log", "is_night"}.issubset(df.columns):
         df["amt_log_x_is_night"] = df["amt_log"] * df["is_night"]
 
-    # merchant_freq — tần suất tương đối (tỷ lệ % trong tập hiện tại)
-    # Notebook tính count tuyệt đối trên tập train ~1.3M dòng. Khi inference trên tập
-    # nhỏ hơn, count tuyệt đối bị distribution shift nặng (merchant xuất hiện 500 lần
-    # trong train chỉ còn 50 lần trong tập upload). Dùng tần suất tương đối
-    # (count / total) thay thế: giữ nguyên thứ tự xếp hạng của các merchant và
-    # ổn định hơn giữa các tập dữ liệu có kích thước khác nhau.
+    # merchant_freq — count tuyệt đối (Cell 26)
     if "merchant_freq" not in df.columns:
         merch_col_raw = find_col(df, ["merchant"])
         if merch_col_raw:
-            n_rows = max(len(df), 1)
             freq_map = df[merch_col_raw].value_counts()
-            df["merchant_freq"] = df[merch_col_raw].map(freq_map).fillna(1) / n_rows
-            notes.append(
-                "Đã tính `merchant_freq` (tần suất tương đối = count/total) "
-                "— giảm distribution shift so với count tuyệt đối khi tập inference nhỏ hơn tập train."
-            )
+            df["merchant_freq"] = df[merch_col_raw].map(freq_map).fillna(1)
+            notes.append("Đã tính `merchant_freq` (số lần xuất hiện của mỗi merchant).")
         else:
-            df["merchant_freq"] = 1.0 / max(len(df), 1)
-            notes.append("⚠️ Thiếu `merchant` — `merchant_freq` gán 1/n.")
+            df["merchant_freq"] = 1
+            notes.append("⚠️ Thiếu `merchant` — `merchant_freq` gán 1.")
 
     # gender mặc định
     if "gender" not in df.columns:
@@ -400,23 +391,19 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
         df = df.sort_values(["cc_num", "unix_time"]).reset_index(drop=True)
         amt_col_raw = find_col(df, CANDIDATE_AMOUNT_COLS)
 
-        # ── Giới hạn RAM: nếu tập > 400K dòng, tính trên sample rồi map lại ──
-        # expanding().mean() và rolling("24h") trên 1.3M dòng tốn ~4–6 GB RAM.
-        # Giải pháp: tính customer_avg_spending bằng cumsum/cumcount (nhanh hơn
-        # transform expanding) và txn_count_24h bằng diff thay vì rolling window.
         if amt_col_raw:
             if "customer_total_spending" not in df.columns:
+                df["customer_total_spending"] = df.groupby("cc_num")[amt_col_raw].cumsum()
                 df["customer_total_spending"] = (
-                    df.groupby("cc_num")[amt_col_raw].cumsum()
-                    - df[amt_col_raw]  # shift: không tính giao dịch hiện tại
-                ).clip(lower=0)
+                    df.groupby("cc_num")["customer_total_spending"].shift(1).fillna(0)
+                )
 
             if "customer_avg_spending" not in df.columns:
-                # Dùng cumsum/cumcount thay vì expanding().mean() — nhanh hơn ~10×
-                cum_sum = df.groupby("cc_num")[amt_col_raw].cumsum() - df[amt_col_raw]
-                cum_cnt = df.groupby("cc_num").cumcount()  # 0-indexed → số GD trước đó
-                df["customer_avg_spending"] = np.where(
-                    cum_cnt > 0, cum_sum / cum_cnt, df[amt_col_raw]
+                df["customer_avg_spending"] = df.groupby("cc_num")[amt_col_raw].transform(
+                    lambda x: x.expanding().mean()
+                )
+                df["customer_avg_spending"] = (
+                    df.groupby("cc_num")["customer_avg_spending"].shift(1).fillna(0)
                 )
 
             if "amt_ratio" not in df.columns:
@@ -427,32 +414,27 @@ def prepare_features(df_raw, feature_cols, categorical_features, pandas_categori
                 )
 
         if "time_since_last_txn" not in df.columns:
-            df["time_since_last_txn"] = df.groupby("cc_num")["unix_time"].diff().fillna(-1)
+            df["time_since_last_txn"] = (
+                df.groupby("cc_num")["unix_time"].diff().fillna(-1)
+            )
 
         if "txn_count_24h" not in df.columns:
             try:
-                # rolling("24h") trên 1.3M dòng tốn nhiều RAM. Dùng cách
-                # nhẹ hơn: đếm số GD của cùng cc_num trong vòng 86400 giây trước.
-                dt = df["unix_time"].values
-                cc = df["cc_num"].values
-                # Tính nhanh bằng groupby diff thay vì rolling window object
                 df["_dt_tmp"] = pd.to_datetime(df["unix_time"], unit="s")
-                df = df.set_index("_dt_tmp")
-                grp = df.groupby("cc_num")
-                txn_counts = (
-                    grp["unix_time"]
+                df["txn_count_24h"] = (
+                    df.set_index("_dt_tmp")
+                    .groupby("cc_num")[amt_col_raw if amt_col_raw else "unix_time"]
                     .rolling("24h", closed="left")
                     .count()
                     .reset_index(level=0, drop=True)
+                    .values
                 )
-                df["txn_count_24h"] = txn_counts.fillna(0).astype(int)
-                df = df.reset_index().drop(columns=["_dt_tmp"], errors="ignore")
-                notes.append("Đã tính đặc trưng hành vi lịch sử (cumsum/cumcount, anti-leakage).")
+                df["txn_count_24h"] = df["txn_count_24h"].fillna(0).astype(int)
+                df = df.drop(columns=["_dt_tmp"])
+                notes.append("Đã tính đặc trưng hành vi lịch sử (expanding window, anti-leakage).")
             except Exception as e:
                 df["txn_count_24h"] = 0
                 df = df.drop(columns=["_dt_tmp"], errors="ignore")
-                if df.index.name == "_dt_tmp":
-                    df = df.reset_index()
                 notes.append(f"⚠️ Không thể tính `txn_count_24h` ({e}) — gán 0.")
     elif need_behav:
         missing_prereq = []
@@ -506,21 +488,10 @@ def reconstruct_hour(df):
 
 
 def assign_decision(prob, threshold):
-    """
-    Phân loại 4 mức rủi ro dựa trên phân phối thực của prob:
-    - Very High : top 25% trong số các giao dịch bị flag (prob >= threshold)
-    - High      : bị flag nhưng không thuộc top 25%
-    - Medium    : prob >= threshold * 0.4 (cảnh báo sớm, chưa qua ngưỡng)
-    - Low       : còn lại
-    Đảm bảo 4 mức luôn hiện diện bất kể giá trị threshold tuyệt đối.
-    """
-    flagged = prob[prob >= threshold]
-    if flagged.size > 10:
-        very_high_cut = float(np.percentile(flagged, 75))
-    else:
-        very_high_cut = min(0.97, threshold * 1.5)
-    medium_cut = threshold * 0.4
-    conditions = [prob >= very_high_cut, prob >= threshold, prob >= medium_cut]
+    very_high = min(0.97, threshold * 2.2)
+    high = threshold
+    medium = threshold * 0.5
+    conditions = [prob >= very_high, prob >= high, prob >= medium]
     risk_labels = np.select(conditions, ["Very High", "High", "Medium"], default="Low")
     decision_map = {"Very High": "Chặn / Từ chối", "High": "Kiểm tra ngay", "Medium": "Theo dõi", "Low": "Phê duyệt"}
     decisions = np.array([decision_map[r] for r in risk_labels])
@@ -618,12 +589,7 @@ with st.sidebar:
         st.warning("Chưa có mô hình. Vui lòng tải file .pkl.")
 
     st.markdown("**2. Dữ liệu giao dịch**")
-    data_file = st.file_uploader(
-        "Tải dữ liệu (.csv) — tối đa 1 GB",
-        type=["csv"],
-        label_visibility="collapsed",
-        help="Hỗ trợ file tới 1 GB nhờ config.toml. Nếu vẫn chậm, dùng slim_dataset.py để thu gọn file trước.",
-    )
+    data_file = st.file_uploader("Tải dữ liệu (.csv)", type=["csv"], label_visibility="collapsed")
     use_demo = st.button("📊 Dùng dữ liệu mẫu để thử nghiệm", use_container_width=True)
 
     st.markdown("---")
@@ -653,16 +619,13 @@ if "demo_mode" not in st.session_state:
 if use_demo:
     st.session_state.demo_mode = True
 
-@st.cache_data(show_spinner="Đang đọc file CSV...")
-def read_csv_upload(file_bytes):
-    return pd.read_csv(io.BytesIO(file_bytes), low_memory=False)
-
 raw_df = None
 if data_file is not None:
-    raw_df = read_csv_upload(data_file.getvalue())
+    raw_df = pd.read_csv(data_file)
     st.session_state.demo_mode = False
 elif st.session_state.demo_mode:
     raw_df = generate_demo_data()
+
 if bundle is None:
     st.title("🛡️ Hệ thống hỗ trợ ra quyết định phát hiện gian lận")
     st.info("👈 Vui lòng tải mô hình `.pkl` ở thanh bên để bắt đầu.")
@@ -698,16 +661,8 @@ try:
 except Exception:
     pass
 
-@st.cache_data(show_spinner="⚙️ Đang xử lý đặc trưng & chạy mô hình...")
-def run_pipeline(raw_df_hash, _model, feature_cols, categorical_features, pandas_categorical):
-    """Cache toàn bộ pipeline để tránh recompute khi người dùng đổi trang hoặc ngưỡng."""
-    X, df_out, notes = prepare_features(raw_df, feature_cols, categorical_features, pandas_categorical)
-    proba = _model.predict_proba(X)[:, 1]
-    return df_out, proba, notes
-
-# Dùng shape+hash nhỏ làm cache key thay vì truyền toàn bộ DataFrame (tránh serialize chậm)
-_cache_key = (raw_df.shape, int(raw_df.iloc[0].astype(str).str.len().sum()) if len(raw_df) > 0 else 0)
-df_full, proba, notes = run_pipeline(_cache_key, model, feature_cols, categorical_features, pandas_categorical)
+X, df_full, notes = prepare_features(raw_df, feature_cols, categorical_features, pandas_categorical)
+proba = model.predict_proba(X)[:, 1]
 df_full["fraud_probability"] = proba
 
 amount_col = find_col(df_full, CANDIDATE_AMOUNT_COLS)
@@ -891,57 +846,6 @@ def page_descriptive():
         fig.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10), showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── Thêm: tỷ lệ gian lận theo danh mục & ban đêm vs ban ngày (EDA Chapter 3) ──
-    if has_ground_truth:
-        st.markdown("###")
-        c5, c6 = st.columns(2)
-        with c5:
-            cat_col_desc = find_col(df_full, ["category", "merchant", "category_risk_tier"])
-            if cat_col_desc and cat_col_desc in df_full.columns:
-                st.markdown(f"**Tỷ lệ gian lận theo `{cat_col_desc}`** *(EDA – Hình 3.2)*")
-                fraud_rate_cat = (
-                    df_full.groupby(cat_col_desc)[label_col]
-                    .apply(lambda x: x.astype(int).mean() * 100)
-                    .sort_values(ascending=True)
-                )
-                fig = px.bar(
-                    x=fraud_rate_cat.values,
-                    y=fraud_rate_cat.index,
-                    orientation="h",
-                    labels={"x": "Tỷ lệ gian lận (%)", "y": ""},
-                )
-                fig.update_traces(marker_color=ACCENT)
-                fig.update_layout(height=max(280, len(fraud_rate_cat) * 28), margin=dict(t=10, b=10, l=10, r=10))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Không tìm thấy cột danh mục để thống kê tỷ lệ gian lận.")
-        with c6:
-            if "is_night" in df_full.columns:
-                st.markdown("**Tỷ lệ gian lận: ban đêm vs ban ngày** *(EDA – Bảng 3.4)*")
-                night_fraud = (
-                    df_full.groupby(df_full["is_night"].map({1: "Ban đêm (22h–3h)", 0: "Ban ngày"}))[label_col]
-                    .apply(lambda x: x.astype(int).mean() * 100)
-                    .reset_index()
-                )
-                night_fraud.columns = ["Khung giờ", "Tỷ lệ gian lận (%)"]
-                fig = px.bar(
-                    night_fraud,
-                    x="Khung giờ",
-                    y="Tỷ lệ gian lận (%)",
-                    color="Khung giờ",
-                    color_discrete_map={"Ban đêm (22h–3h)": ACCENT, "Ban ngày": PRIMARY},
-                    text_auto=".2f",
-                )
-                fig.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10), showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-                # Số liệu tóm tắt
-                day_rate = df_full[df_full["is_night"] == 0][label_col].astype(int).mean() * 100
-                night_rate = df_full[df_full["is_night"] == 1][label_col].astype(int).mean() * 100
-                if day_rate > 0:
-                    st.caption(f"Giao dịch ban đêm có tỷ lệ gian lận cao gấp **{night_rate/day_rate:.1f}×** ban ngày.")
-            else:
-                st.info("Không có cột `is_night` để so sánh ban đêm/ban ngày.")
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # TRANG 3 — NGUYÊN NHÂN GIAN LẬN (DIAGNOSTIC ANALYTICS)
@@ -979,7 +883,7 @@ def page_diagnostic():
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        kpi_card("Xảy ra vào ban đêm", f"{night_pct:.0f}%" if not np.isnan(night_pct) else "—", "22h–6h", kind="alert")
+        kpi_card("Xảy ra vào ban đêm", f"{night_pct:.0f}%" if not np.isnan(night_pct) else "—", "22h–3h", kind="alert")
     with c2:
         kpi_card("Giao dịch trực tuyến", f"{online_pct:.0f}%" if not np.isnan(online_pct) else "—")
     with c3:
@@ -1049,20 +953,11 @@ def page_diagnostic():
         fraud_amt_median = float(np.median(amount_arr_diag[fraud_idxs])) if fraud_idxs.sum() > 0 else 100.0
         fraud_amt_median = max(fraud_amt_median, 1.0)
 
-        cost_fp_pct = st.slider(
-            "Chi phí xử lý 1 FP (% so với trung vị giá trị fraud)",
-            min_value=1, max_value=200, value=10, step=1,
-            key="diag_cost_fp",
-            help=(
-                f"Trung vị amt fraud trong tập này ≈ ${fraud_amt_median:,.0f}. "
-                f"Ví dụ: 10% → ${fraud_amt_median*0.10:,.0f}/FP. "
-                f"Pipeline 2 dùng $5/FP = tương đương {5/fraud_amt_median*100:.1f}% tập train."
-            )
-        )
-        cost_fp_diag = fraud_amt_median * cost_fp_pct / 100.0
+        COST_FP_FIXED = 5.0  # nhất quán với Pipeline 2 (lightgbm.py)
+        cost_fp_diag = COST_FP_FIXED
         st.caption(
-            f"→ Chi phí FP hiệu dụng: **${cost_fp_diag:,.2f}** / cảnh báo sai "
-            f"(trung vị amt fraud = ${fraud_amt_median:,.0f}, tỷ lệ {cost_fp_pct}%)"
+            f"→ Chi phí FP: **${cost_fp_diag:,.2f}** / cảnh báo sai "
+            f"— nhất quán với Pipeline 2 (COST_PER_FALSE_ALARM = $5)."
         )
 
         # Tính đường cong chi phí trên lưới 99 điểm — nhất quán với Pipeline 2
